@@ -111,6 +111,14 @@ var (
 		[]string{"status"},
 	)
 
+	webhookOutboxEnqueueFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "velox_webhook_outbox_enqueue_failures_total",
+			Help: "Total webhook outbox enqueue failures by event type.",
+		},
+		[]string{"event_type"},
+	)
+
 	dunningRunsProcessed = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "velox_dunning_runs_processed_total",
@@ -368,6 +376,11 @@ func RecordPaymentCharge(result string) {
 // RecordWebhookDelivery records a webhook delivery status ("succeeded", "failed", or "pending").
 func RecordWebhookDelivery(status string) {
 	webhookDeliveries.WithLabelValues(status).Inc()
+}
+
+// RecordWebhookOutboxEnqueueFailure records a failed attempt to enqueue an event.
+func RecordWebhookOutboxEnqueueFailure(eventType string) {
+	webhookOutboxEnqueueFailures.WithLabelValues(eventType).Inc()
 }
 
 // RecordDunningRun records a processed dunning run outcome ("succeeded" or
@@ -677,6 +690,14 @@ func RegisterQueueDepthGauges(invoiceGrace time.Duration, count func(query strin
 	gauge("velox_webhook_outbox_pending",
 		"Outbound webhook events waiting for the outbox dispatcher (status='pending'). -1 = metric query failed.",
 		`SELECT COUNT(*) FROM webhook_outbox WHERE status = 'pending'`)
+	gauge("velox_webhook_outbox_failed",
+		"Webhook outbox events marked failed after exhausting processing attempts. -1 = metric query failed.",
+		`SELECT COUNT(*) FROM webhook_outbox WHERE status = 'failed'`)
+	gauge("velox_webhook_outbox_oldest_pending_age_seconds",
+		"Age in seconds of the oldest pending webhook outbox event. 0 when empty. -1 = metric query failed.",
+		`SELECT COALESCE(EXTRACT(EPOCH FROM now() - MIN(created_at)), 0)
+		FROM webhook_outbox
+		WHERE status = 'pending'`)
 	gauge("velox_dunning_active_runs",
 		"Dunning runs currently active. -1 = metric query failed.",
 		`SELECT COUNT(*) FROM invoice_dunning_runs WHERE state = 'active'`)
