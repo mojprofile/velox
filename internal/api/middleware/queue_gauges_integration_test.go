@@ -68,7 +68,7 @@ func TestQueueDepthGauges_EveryQueryRunsOnRealPostgres(t *testing.T) {
 		}
 		seen[f.GetName()] = true
 	}
-	for _, name := range []string{"velox_billing_due_subscriptions", "velox_billing_oldest_due_age_seconds", "velox_billing_failing_subscriptions", "velox_auto_charge_queued_invoices", "velox_parked_invoices", "velox_email_outbox_pending"} {
+	for _, name := range []string{"velox_billing_due_subscriptions", "velox_billing_oldest_due_age_seconds", "velox_billing_failing_subscriptions", "velox_auto_charge_queued_invoices", "velox_parked_invoices", "velox_email_outbox_pending", "velox_webhook_outbox_pending", "velox_webhook_outbox_failed", "velox_webhook_outbox_oldest_pending_age_seconds"} {
 		if !seen[name] {
 			t.Errorf("gauge %s not registered", name)
 		}
@@ -216,5 +216,59 @@ func TestBillingGauges_DueAndFailingPartition(t *testing.T) {
 	}
 	if byDomain != retrying+parked {
 		t.Errorf("gauge predicate counts %v failing, domain.SubscriptionBillingFailingSQL counts %v: the hand copy in metrics.go has drifted", retrying+parked, byDomain)
+	}
+}
+
+func TestWebhookOutboxGauges_EmptyQueue(t *testing.T) {
+	db := vtestutil.SetupTestDB(t)
+	registerGauges(db)
+
+	if got := gaugeValue(t, "velox_webhook_outbox_pending", nil); got != 0 {
+		t.Errorf("pending count: got %v, want 0", got)
+	}
+	if got := gaugeValue(t, "velox_webhook_outbox_oldest_pending_age_seconds", nil); got != 0 {
+		t.Errorf("oldest pending age: got %v, want 0", got)
+	}
+	if got := gaugeValue(t, "velox_webhook_outbox_failed", nil); got != 0 {
+		t.Errorf("failed count: got %v, want 0", got)
+	}
+}
+
+func TestWebhookOutboxGauges_MixedStatuses(t *testing.T) {
+	db := vtestutil.SetupTestDB(t)
+	registerGauges(db)
+	ctx := context.Background()
+
+	tenantID := vtestutil.CreateTestTenant(t, db, "Webhook gauges")
+	admin := vtestutil.AdminPool(t)
+
+	_, err := admin.ExecContext(ctx, `
+		INSERT INTO webhook_outbox
+			(id, tenant_id, event_type, payload, status, attempts, created_at, livemode)
+		VALUES
+			('whob_gauge_pending_old', $1, 'invoice.finalized', '{}',
+			 'pending', 0, now() - interval '10 minutes', false),
+			('whob_gauge_pending_new', $1, 'invoice.finalized', '{}',
+			 'pending', 0, now() - interval '1 minute', true),
+			('whob_gauge_dispatched', $1, 'invoice.finalized', '{}',
+			 'dispatched', 0, now() - interval '2 hours', false),
+			('whob_gauge_failed_1', $1, 'invoice.finalized', '{}',
+			 'failed', 15, now() - interval '3 hours', false),
+			('whob_gauge_failed_2', $1, 'invoice.finalized', '{}',
+			 'failed', 15, now() - interval '4 hours', true)
+	`, tenantID)
+	if err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	if got := gaugeValue(t, "velox_webhook_outbox_pending", nil); got != 2 {
+		t.Errorf("pending count: got %v, want 2", got)
+	}
+	if age := gaugeValue(t, "velox_webhook_outbox_oldest_pending_age_seconds", nil); age < 590 || age > 630 {
+		t.Errorf("oldest pending age: got %v, want about 600 seconds", age)
+	}
+
+	if got := gaugeValue(t, "velox_webhook_outbox_failed", nil); got != 2 {
+		t.Errorf("failed count: got %v, want 2", got)
 	}
 }
