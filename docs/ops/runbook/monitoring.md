@@ -40,6 +40,7 @@ alerting tier: what should page someone, and what is only informational.
 | `time() - velox_scheduler_last_run_timestamp_seconds` | > 2× tick interval | Scheduler stalled on this replica. `/health/ready` shows it in its body but stays 200, so this alert is how you find out |
 | `velox_leader_last_tick_age_seconds{role}` | > 3× the role's interval | No replica has finished a tick of this role. **On a busy billing day this trips too**: if `velox_billing_due_subscriptions` is falling, the tick is draining; do not restart it. See [A background job is stuck](background-job-stuck.md) |
 | `increase(velox_leader_lease_lost_total[1h])` | > 0 | A tick lost its lease. Split by `reason`, and exclude `paused` (an operator action). What each reason means: [Lease-lost reasons](background-job-stuck.md#lease-lost-reasons) |
+| `velox_webhook_outbox_enqueue_failures_total{event_type}` | any new failure, including a newly appearing nonzero series | A webhook event could not be added to the outbox; an event may be missing. Split by `event_type` to identify the producer. See [Webhook outbox](webhook-outbox-backed-up.md) |
 
 ### Warn (Slack or email, not page)
 
@@ -54,6 +55,8 @@ alerting tier: what should page someone, and what is only informational.
 | `velox_stripe_breaker_state` | == 2 (open; 0=closed, 1=half_open) | Stripe API circuit breaker tripped |
 | `velox_email_outbox_pending` | > 1000 | Email dispatcher stuck or SMTP provider issue (−1 = the metric query itself failed) |
 | `velox_webhook_outbox_pending` | > 1000 | Webhook dispatcher stuck (−1 = metric query failed) |
+| `velox_webhook_outbox_oldest_pending_age_seconds` | > 259200 (72h) | A pending event is older than the outbox retry ladder. Pending rows can legitimately wait during retries, so alert on age beyond the ladder. −1 = metric query failed. See [Webhook outbox](webhook-outbox-backed-up.md) |
+| `velox_webhook_outbox_failed` | > 0 | An outbox event exhausted its processing attempts and will not be retried automatically. −1 = metric query failed. See [Webhook outbox](webhook-outbox-backed-up.md) |
 | `velox_creditnote_pending_tax_reversals` | any row older than 24h (alert on age, not presence) | An issued credit note whose tax reversal at the provider is still owed. See the note below the table |
 | `velox_invoice_pending_tax_reversals` | any row older than 24h | A voided `stripe_tax` invoice whose committed tax transaction has no confirmed reversal. See the note below the table |
 | `velox_creditnote_pending_issue_drafts` | sustained growth over days | Clawback drafts not issuing. Alert on growth or age, not presence. See [Clawback drafts](clawback-drafts-not-issuing.md) |
