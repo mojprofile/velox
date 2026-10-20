@@ -26,6 +26,7 @@ import (
 	"github.com/sagarsuperuser/velox/internal/platform/clock"
 	"github.com/sagarsuperuser/velox/internal/platform/money"
 	"github.com/sagarsuperuser/velox/internal/platform/postgres"
+	"github.com/sagarsuperuser/velox/internal/platform/scheduler"
 	"github.com/sagarsuperuser/velox/internal/platform/telemetry"
 	"github.com/sagarsuperuser/velox/internal/subscription"
 	"github.com/sagarsuperuser/velox/internal/tax"
@@ -199,6 +200,14 @@ func (e *Engine) emitFinalizeAuditTx(ctx context.Context, tx *sql.Tx, inv domain
 	return e.auditLogger.LogInTx(ctx, tx, entry)
 }
 
+// EmitFinalizeAuditTx is emitFinalizeAuditTx for an invoice another domain
+// inserts already finalized on its own transaction: the subscription handler's
+// proration invoice (upgrade, seat increase, added item). It writes the same
+// row the engine writes for its own invoices, so the two cannot drift (#1279).
+func (e *Engine) EmitFinalizeAuditTx(ctx context.Context, tx *sql.Tx, inv domain.Invoice) error {
+	return e.emitFinalizeAuditTx(ctx, tx, inv)
+}
+
 // finalizeAuditEmit adapts emitFinalizeAuditTx to the CreateInvoiceWithLineItemsAudited
 // callback shape, so the own-tx finalize paths audit on the create tx. The store
 // hands back the persisted invoice as `out` (with its real ID); audit that, not
@@ -218,19 +227,34 @@ func (e *Engine) finalizeAuditEmit(ctx context.Context) func(tx *sql.Tx, out dom
 // billing path (cycle / create / cancel-final / threshold) emitted NO
 // invoice.finalized at all — integrators only ever saw operator-clicked finalizes.
 func (e *Engine) dispatchInvoiceFinalized(ctx context.Context, sub domain.Subscription, inv domain.Invoice) {
+	e.DispatchInvoiceFinalized(ctx, sub.TenantID, inv)
+}
+
+// DispatchInvoiceFinalized sends invoice.finalized for an invoice born
+// finalized, after the transaction that created it committed. Exported for
+// the subscription handler's proration invoice, so it sends the payload the
+// engine sends for its own invoices (#1279). Drafts send nothing: they send
+// it from invoice.Service.Finalize when they finalize.
+//
+// It is sent before the collector applies the customer's credit (ADR-116), so
+// amount_due_cents is the amount before that credit. credits_applied_cents is
+// the credit on the invoice when the event is built, read from the invoice,
+// so the two add up as they do on the invoice itself (#1281).
+func (e *Engine) DispatchInvoiceFinalized(ctx context.Context, tenantID string, inv domain.Invoice) {
 	if inv.Status != domain.InvoiceFinalized {
 		return
 	}
 	if e.events != nil {
-		e.dispatchEvent(ctx, sub.TenantID, domain.EventInvoiceFinalized, map[string]any{
-			"invoice_id":         inv.ID,
-			"invoice_number":     inv.InvoiceNumber,
-			"customer_id":        inv.CustomerID,
-			"status":             string(inv.Status),
-			"payment_status":     string(inv.PaymentStatus),
-			"total_amount_cents": inv.TotalAmountCents,
-			"amount_due_cents":   inv.AmountDueCents,
-			"currency":           inv.Currency,
+		e.dispatchEvent(ctx, tenantID, domain.EventInvoiceFinalized, map[string]any{
+			"invoice_id":            inv.ID,
+			"invoice_number":        inv.InvoiceNumber,
+			"customer_id":           inv.CustomerID,
+			"status":                string(inv.Status),
+			"payment_status":        string(inv.PaymentStatus),
+			"total_amount_cents":    inv.TotalAmountCents,
+			"amount_due_cents":      inv.AmountDueCents,
+			"credits_applied_cents": inv.CreditsAppliedCents,
+			"currency":              inv.Currency,
 		})
 	}
 }
@@ -452,8 +476,11 @@ type PaymentReadiness interface {
 // payment-failed email) access *payment.Stripe directly and use the
 // dedicated typed method (ChargeInvoiceForDunningRetry). Keeps engine
 // package free of payment-options surface.
+//
+// hold is the charge hold the caller's claim returned (ADR-127): the charge
+// re-checks it right before sending and sends nothing without it.
 type InvoiceCharger interface {
-	ChargeInvoice(ctx context.Context, tenantID string, inv domain.Invoice, stripeCustomerID, stripePaymentMethodID string) (domain.Invoice, error)
+	ChargeInvoice(ctx context.Context, tenantID string, inv domain.Invoice, hold domain.ChargeHold, stripeCustomerID, stripePaymentMethodID string) (domain.Invoice, error)
 }
 
 // SubscriptionReader reads subscription and plan data for billing.
@@ -648,13 +675,16 @@ type InvoiceWriter interface {
 	// auto-charge sweep checks it so a card-less invoice is emailed exactly
 	// once, not once per tick.
 	SetNoPMNotifiedAt(ctx context.Context, tenantID, invoiceID string, at time.Time) error
-	// ClaimAutoCharge takes the per-invoice charge lease (HA hazard #1):
-	// CAS re-asserting the full eligibility predicate; false = another
-	// leader owns the invoice or its state moved on — skip, never charge.
-	ClaimAutoCharge(ctx context.Context, tenantID, id string) (bool, error)
-	// ReleaseAutoChargeClaim clears the lease on provably-pre-Stripe skip
-	// paths so the next tick/Advance retries immediately.
-	ReleaseAutoChargeClaim(ctx context.Context, tenantID, id string) error
+	// ClaimAutoCharge takes the per-invoice charge hold (HA hazard #1,
+	// ADR-127): a claim re-asserting the full eligibility predicate and
+	// refusing any set hold. The zero ChargeHold = another owner holds the
+	// invoice, a lost charge waits for the stale-hold sweep, or its state
+	// moved on — skip, never charge.
+	ClaimAutoCharge(ctx context.Context, tenantID, id string) (domain.ChargeHold, error)
+	// ReleaseChargeHold clears this owner's hold (compared by token) on
+	// paths that sent no charge, so the next tick/Advance retries
+	// immediately instead of waiting for the stale-hold sweep.
+	ReleaseChargeHold(ctx context.Context, tenantID, id string, hold domain.ChargeHold) error
 	ListAutoChargePending(ctx context.Context, after domain.InvoiceKeyset, limit int) ([]domain.Invoice, error)
 	// ListAutoChargePendingForClock is the catchup-path counterpart to
 	// ListAutoChargePending — returns invoices whose owning subscription
@@ -1597,6 +1627,7 @@ func (e *Engine) ApplyTaxToLineItems(ctx context.Context, tenantID, customerID, 
 		return TaxApplication{}, fmt.Errorf("settings store not wired")
 	}
 
+	subtotal = commitInvoiceSubtotal(lineItems, subtotal)
 	app := TaxApplication{
 		SubtotalCents: subtotal,
 		DiscountCents: discount,
@@ -1636,6 +1667,7 @@ func (e *Engine) ApplyTaxToLineItems(ctx context.Context, tenantID, customerID, 
 		return TaxApplication{}, refuse(refusalTaxProvider, fmt.Errorf("resolve tax provider: %w", err))
 	}
 	app.TaxProvider = provider.Name()
+	commitReason := commitLineTaxReason(provider.Name())
 
 	var profile domain.CustomerBillingProfile
 	if e.profiles != nil && customerID != "" {
@@ -1685,6 +1717,22 @@ func (e *Engine) ApplyTaxToLineItems(ctx context.Context, tenantID, customerID, 
 		return TaxApplication{}, err
 	}
 
+	// An invoice that only sells prepaid credit has nothing to tax (the
+	// purchase is an advance payment; ADR-078 amendment 2026-10-19). Every
+	// other line reaches the request, so an empty request over a non-empty
+	// invoice means every line is a commit line. The provider is not asked:
+	// there is nothing to calculate, so a provider outage cannot hold the
+	// invoice as pending, and a customer's exemption or reverse-charge status
+	// is not printed on a sale that is untaxed for another reason.
+	if len(reqLines) == 0 && len(lineItems) > 0 {
+		for i := range lineItems {
+			if lineItems[i].IsCommitLine() {
+				stampUntaxedCommitLine(&lineItems[i], commitReason)
+			}
+		}
+		return app, nil
+	}
+
 	req := tax.Request{
 		Currency: currency,
 		CustomerAddress: tax.Address{
@@ -1716,6 +1764,10 @@ func (e *Engine) ApplyTaxToLineItems(ctx context.Context, tenantID, customerID, 
 		slog.Warn("tax: provider calculation failed, deferring invoice",
 			"error", err, "tenant_id", tenantID, "provider", provider.Name())
 		for i := range lineItems {
+			if lineItems[i].IsCommitLine() {
+				stampUntaxedCommitLine(&lineItems[i], commitReason)
+				continue
+			}
 			lineItems[i].TaxRate = 0
 			lineItems[i].TaxAmountCents = 0
 			lineItems[i].TotalAmountCents = lineItems[i].AmountCents
@@ -1769,10 +1821,16 @@ func (e *Engine) ApplyTaxToLineItems(ctx context.Context, tenantID, customerID, 
 	// split rule); with no negative lines it is the provider's positional
 	// result unchanged. An empty Ref marks a line the provider never
 	// produced — leave that line item untouched, as the positional loop
-	// always has.
+	// always has. A commit line was never sent: it is stamped untaxed, and
+	// its price counts toward the net subtotal as it stands.
 	expanded := expandTaxResultLines(res.Lines, lineGroups, lineItems)
 	var netSubtotalSum int64
 	for i := range lineItems {
+		if lineItems[i].IsCommitLine() {
+			stampUntaxedCommitLine(&lineItems[i], commitReason)
+			netSubtotalSum += lineItems[i].AmountCents
+			continue
+		}
 		if i >= len(expanded) {
 			break
 		}
@@ -1864,10 +1922,18 @@ type dueFetch func(ctx context.Context, exclude []string, limit int) ([]domain.S
 // grace is the invoice grace this run honours (ADR-120): the wall-clock runs
 // pass the engine's, the test-clock run passes 0. It goes to
 // billSubscription, whose checks must use the same instant as fetch's scan.
+//
+// A sub whose attempt panics is handled like one that failed: attemptSub has
+// saved the failure, and the sub goes into exclude and failures. The drain
+// bills the rest, and the first panic is raised again when it returns, so the
+// caller still sees it (the scheduler's tick ends as panicked; the operator's
+// run answers 500; the test-clock catch-up marks the clock failed). Without
+// this, one panicking sub stopped every sub after it in the run.
 func (e *Engine) drainDue(ctx context.Context, batchSize int, fetch dueFetch, onPage func(), grace time.Duration, logArgs ...any) (int, []SubBillError) {
 	if batchSize <= 0 {
 		batchSize = 50
 	}
+	var panics scheduler.Panics
 	generated := 0
 	var failures []SubBillError
 	attempted := make(map[string]bool)
@@ -1875,14 +1941,17 @@ func (e *Engine) drainDue(ctx context.Context, batchSize int, fetch dueFetch, on
 	for {
 		if err := ctx.Err(); err != nil {
 			failures = append(failures, SubBillError{Err: fmt.Errorf("billing run ctx done: %w", err)})
+			panics.Repanic()
 			return generated, failures
 		}
 		due, err := fetch(ctx, exclude, batchSize)
 		if err != nil {
 			failures = append(failures, SubBillError{Err: fmt.Errorf("fetch due subscriptions: %w", err)})
+			panics.Repanic()
 			return generated, failures
 		}
 		if len(due) == 0 {
+			panics.Repanic()
 			return generated, failures
 		}
 		for _, sub := range due {
@@ -1890,6 +1959,7 @@ func (e *Engine) drainDue(ctx context.Context, batchSize int, fetch dueFetch, on
 			// would only fail each sub with the same ctx error.
 			if err := ctx.Err(); err != nil {
 				failures = append(failures, SubBillError{Err: fmt.Errorf("billing run ctx done: %w", err)})
+				panics.Repanic()
 				return generated, failures
 			}
 			if attempted[sub.ID] {
@@ -1901,7 +1971,13 @@ func (e *Engine) drainDue(ctx context.Context, batchSize int, fetch dueFetch, on
 				continue
 			}
 			attempted[sub.ID] = true
-			n, err := e.attemptSub(ctx, sub, grace, logArgs...)
+			// errBillPanic stays when attemptSub panics: the assignment
+			// below never happens.
+			n, err := 0, errBillPanic
+			func() {
+				defer panics.Guard(append([]any{"subscription_id", sub.ID, "tenant_id", sub.TenantID}, logArgs...)...)
+				n, err = e.attemptSub(ctx, sub, grace, logArgs...)
+			}()
 			generated += n
 			if errors.Is(err, errBillingGated) {
 				// Not attempted, so not a failure and never "still due" in
@@ -2360,7 +2436,7 @@ func (e *Engine) applyDueScheduledPlanChanges(ctx context.Context, sub domain.Su
 			// EVIDENCE: the swap happened; record it. Independent of the webhook.
 			if e.auditLogger != nil {
 				for _, was := range dueItems {
-					_ = e.auditLogger.Log(ctx, sub.TenantID, "subscription.pending_change_applied", "subscription", sub.ID, sub.Code, map[string]any{
+					_ = e.auditLogger.Log(ctx, sub.TenantID, domain.AuditActionSubscriptionPendingChangeApplied, "subscription", sub.ID, sub.Code, map[string]any{
 						"item_id":     was.ID,
 						"old_plan_id": was.PlanID,
 						"new_plan_id": newPlanByItem[was.ID],
@@ -2569,7 +2645,7 @@ func (e *Engine) handleTrialState(ctx context.Context, sub domain.Subscription, 
 			// catchup expiry scans write.
 			if e.auditLogger != nil {
 				meta := map[string]any{
-					"action":       "trial_ended",
+					"action":       domain.SubAuditTrialEnded,
 					"customer_id":  sub.CustomerID,
 					"triggered_by": "schedule",
 				}
@@ -2843,7 +2919,7 @@ func (e *Engine) buildLineItems(ctx context.Context, sub domain.Subscription, no
 						slog.Warn("cycle: usage below zero after corrections — billed as 0",
 							"meter", meter.Key, "quantity", qty.String(),
 							"subscription_id", sub.ID)
-						belowZero.add(meterID, meter.Key, qty, ivStart, ivEnd)
+						belowZero.add(meterID, meter.Key, meter.Name, qty, ivStart, ivEnd)
 						continue
 					}
 					if ratingRuleID == "" {
@@ -2910,7 +2986,7 @@ func (e *Engine) buildLineItems(ctx context.Context, sub domain.Subscription, no
 				slog.Warn("cycle: usage below zero after corrections — billed as 0",
 					"meter", meter.Key, "quantity", quantity.String(),
 					"subscription_id", sub.ID)
-				belowZero.add(meterID, meter.Key, quantity, ivStart, ivEnd)
+				belowZero.add(meterID, meter.Key, meter.Name, quantity, ivStart, ivEnd)
 				continue
 			}
 
@@ -4077,7 +4153,7 @@ func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscripti
 						slog.Warn("cancel: usage below zero after corrections — billed as 0",
 							"meter", meter.Key, "quantity", qty.String(),
 							"subscription_id", sub.ID)
-						belowZero.add(meterID, meter.Key, qty, ivStart, ivEnd)
+						belowZero.add(meterID, meter.Key, meter.Name, qty, ivStart, ivEnd)
 						continue
 					}
 					if ratingRuleID == "" {
@@ -4147,7 +4223,7 @@ func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscripti
 			if quantity.IsNegative() {
 				slog.Warn("cancel: usage below zero after corrections — billed as 0",
 					"meter", meter.Key, "quantity", quantity.String(), "subscription_id", sub.ID)
-				belowZero.add(meterID, meter.Key, quantity, iv.start, iv.end)
+				belowZero.add(meterID, meter.Key, meter.Name, quantity, iv.start, iv.end)
 				continue
 			}
 			if meter.RatingRuleVersionID == "" {
@@ -4655,12 +4731,6 @@ func (e *Engine) prepareSwapCredit(ctx context.Context, sub domain.Subscription,
 	}, true, nil
 }
 
-// errHeadroomExhausted is the allocator's "an ALL-PAID funding set cannot
-// absorb the owed credit": the period was already fully credited (an earlier
-// credit note took its headroom), so nothing more is owed. It is the only
-// allocation error the relief trunk lets the change proceed past.
-var errHeadroomExhausted = errors.New("unused-prebill credit exceeds the funding invoices' remaining headroom")
-
 // reliefTx is the shared in-tx trunk of BillOnCancelDraftsTx and
 // BillOnPlanSwapDraftsTx: funding lookup → allocation → one write per share on
 // the caller's tx. what labels log lines ("cancel proration" / "plan-swap
@@ -4734,14 +4804,10 @@ func (e *Engine) reliefTx(ctx context.Context, tx *sql.Tx, sub domain.Subscripti
 		return r, nil
 	}
 
+	// What does not fit in the funding invoices' remaining room is logged by
+	// the allocator, and the shares carry what fits. A set already fully
+	// credited gets no shares, so the change proceeds with no relief.
 	shares, err := e.allocateUnusedAcrossFunding(ctx, sub, allocate, in.PeriodEnd, in.CancelAt, totalUnused)
-	if errors.Is(err, errHeadroomExhausted) {
-		// Already fully credited — nothing more is owed. Loud, because it can
-		// also mean drift, but not a reason to refuse the cancel or swap.
-		slog.ErrorContext(ctx, what+": funding invoices already fully credited; no further relief",
-			"subscription_id", sub.ID, "customer_id", sub.CustomerID, "error", err)
-		return r, nil
-	}
 	if err != nil {
 		return domain.Relief{}, fmt.Errorf("%s: allocate across funding invoices: %w", what, err)
 	}
@@ -4868,11 +4934,12 @@ type fundingShare struct {
 // allocateUnusedAcrossFunding is the PURE allocation half: weight each funding
 // invoice by its own unused net contribution, cap each at its remaining headroom
 // (PAID: creditable = total − already-credited; UNPAID: amount_due), water-fill
-// via AllocateByWeightCapped, and surface an unplaceable remainder LOUDLY (all-paid
-// fault) or as a WARN (mixed set). READS + MATH only — no Create/Issue — so it is
-// safe inside a coordinator tx. CRITICAL: the per-PAID-source net→gross clamp AND
-// the remainder loud-fail live HERE, so the #276/#277/#278 over-credit invariant
-// (cumulative credit ≤ funding headroom) holds for every relief write. The CreditedCents
+// via AllocateByWeightCapped, and return the shares that fit. A remainder that
+// fits nowhere is logged, as ERROR for an all-paid set and WARN for a mixed one,
+// and never placed. READS + MATH only — no Create/Issue — so it is safe inside a
+// coordinator tx. CRITICAL: the per-source caps and the net→gross clamp live
+// HERE, so the #276/#277/#278 over-credit invariant (cumulative credit ≤ funding
+// headroom) holds for every relief write. The CreditedCents
 // headroom read MUST stay off any coordinator tx — it counts non-voided notes
 // INCLUDING drafts, so an on-tx read would let an in-flight draft shrink its own
 // headroom.
@@ -4950,22 +5017,36 @@ func (e *Engine) allocateUnusedAcrossFunding(ctx context.Context, sub domain.Sub
 
 	nets, remainder := money.AllocateByWeightCapped(totalUnused, weights, netCaps)
 	if remainder > 0 {
-		if !hasUnpaid {
-			// All-paid funding set can't absorb the owed credit — a genuine fault
-			// (period already fully credited, or drift). Fail LOUD; never silently
-			// drop the customer's money.
-			return nil, fmt.Errorf("%w: %d of %d across %d invoice(s)", errHeadroomExhausted, remainder, totalUnused, len(sources))
+		var placed int64
+		for _, n := range nets {
+			placed += n
 		}
-		// Mixed/unpaid set: paid sources already absorbed all they could (the
-		// allocator water-fills overflow onto them first); the residual is value
-		// an UNPAID invoice can't relieve beyond its amount_due and applied
-		// credits — nothing else was paid for it, so there's nothing more to
-		// return. Not a fault, but log it.
-		slog.WarnContext(ctx, "unused-prebill credit: residual unplaceable on unpaid funding invoice(s)",
-			"subscription_id", sub.ID,
-			"residual_cents", remainder,
-			"total_unused", totalUnused,
-			"funding_invoices", len(sources))
+		if hasUnpaid {
+			// Mixed/unpaid set: paid sources already absorbed all they could
+			// (the allocator water-fills overflow onto them first); the
+			// residual is value an UNPAID invoice can't relieve beyond its
+			// amount_due and applied credits — nothing else was paid for it,
+			// so there's nothing more to return. Not a fault, but log it.
+			slog.WarnContext(ctx, "unused-prebill credit: residual unplaceable on unpaid funding invoice(s)",
+				"subscription_id", sub.ID,
+				"placed_cents", placed,
+				"residual_cents", remainder,
+				"total_unused", totalUnused,
+				"funding_invoices", len(sources))
+		} else {
+			// All-paid set: earlier credit notes (an operator note, or a
+			// waiver after customer credits paid part of the invoice) left
+			// less room than the unused part. Place what fits; the caps keep
+			// every invoice's credit within its total (#276-#278). Loud,
+			// because it can also mean drift. With no room at all, nothing is
+			// placed: the period is already fully credited.
+			slog.ErrorContext(ctx, "unused-prebill credit: funding invoices' remaining room is smaller than the unused part; placed what fits",
+				"subscription_id", sub.ID,
+				"placed_cents", placed,
+				"residual_cents", remainder,
+				"total_unused", totalUnused,
+				"funding_invoices", len(sources))
+		}
 	}
 
 	var shares []fundingShare
@@ -5182,13 +5263,26 @@ func (e *Engine) processAutoCharge(ctx context.Context, pending []domain.Invoice
 		// outcome (or a webhook settle) landing between list and claim
 		// fails the claim here — BEFORE the credit-apply/refresh path
 		// that could otherwise mint a divergent Stripe idempotency key.
-		claimed, cerr := e.invoices.ClaimAutoCharge(ctx, inv.TenantID, inv.ID)
+		//
+		// Refused also while a charge whose result was lost waits for the
+		// stale-hold sweep to ask Stripe (ADR-127): charging it now could take
+		// a second payment. The sweep runs before this one in the same tick.
+		hold, cerr := e.invoices.ClaimAutoCharge(ctx, inv.TenantID, inv.ID)
 		if cerr != nil {
 			errs = append(errs, fmt.Errorf("claim auto-charge %s: %w", inv.ID, cerr))
 			continue
 		}
-		if !claimed {
+		if !hold.Held() {
 			continue
+		}
+		// Every path below that sends no charge releases the hold (by its
+		// token): left set, it would wait for the stale-hold sweep. The store
+		// runs the release even after a shutdown ends ctx.
+		release := func() {
+			if err := e.invoices.ReleaseChargeHold(ctx, inv.TenantID, inv.ID, hold); err != nil {
+				slog.Warn("auto-charge: releasing the charge hold failed — the invoice waits for the stale-hold sweep",
+					"invoice_id", inv.ID, "error", err)
+			}
 		}
 		// Work from the row as it is now, not the list snapshot: a rival
 		// collector may have applied credits or sent the no-payment-method
@@ -5196,7 +5290,7 @@ func (e *Engine) processAutoCharge(ctx context.Context, pending []domain.Invoice
 		fresh, err := e.invoices.GetInvoice(ctx, inv.TenantID, inv.ID)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("reload invoice %s after claim: %w", inv.ID, err))
-			_ = e.invoices.ReleaseAutoChargeClaim(ctx, inv.TenantID, inv.ID)
+			release()
 			continue
 		}
 		inv = fresh
@@ -5211,15 +5305,16 @@ func (e *Engine) processAutoCharge(ctx context.Context, pending []domain.Invoice
 			if _, err := e.credits.ApplyToInvoiceAt(ctx, inv.TenantID, inv.CustomerID, inv.ID, inv.AmountDueCents, settleAt, inv.InvoiceNumber); err != nil {
 				slog.Warn("auto-charge: credit apply failed — skipping charge to avoid overcharging; will retry next tick",
 					"invoice_id", inv.ID, "error", err)
-				// Provably pre-Stripe: release the lease so the next
-				// tick/Advance retries immediately instead of waiting it out.
-				_ = e.invoices.ReleaseAutoChargeClaim(ctx, inv.TenantID, inv.ID)
+				// Provably pre-Stripe: release the hold so the next
+				// tick/Advance retries immediately.
+				release()
 				continue
 			}
 			// Refresh: credits may have reduced (or fully covered) amount_due.
 			refreshed, err := e.invoices.GetInvoice(ctx, inv.TenantID, inv.ID)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("refresh invoice %s after credit apply: %w", inv.ID, err))
+				release() // provably pre-Stripe
 				continue
 			}
 			inv = refreshed
@@ -5231,7 +5326,10 @@ func (e *Engine) processAutoCharge(ctx context.Context, pending []domain.Invoice
 			// The claim admitted only a finalized, pending row, and MarkPaid
 			// re-checks status and tax_status under FOR UPDATE, so a draft
 			// can't be settled here. MarkPaid also clears the flag.
-			if _, err := e.invoices.MarkPaid(ctx, inv.TenantID, inv.ID, "", settleAt); err != nil {
+			// No charge is sent either way, so the hold is released either way.
+			_, err := e.invoices.MarkPaid(ctx, inv.TenantID, inv.ID, "", settleAt)
+			release()
+			if err != nil {
 				errs = append(errs, fmt.Errorf("settle zero-due invoice %s: %w", inv.ID, err))
 				continue
 			}
@@ -5245,6 +5343,14 @@ func (e *Engine) processAutoCharge(ctx context.Context, pending []domain.Invoice
 		}
 
 		stripeCusID, stripePMID, err := e.paymentSetups.ResolveForCharge(ctx, inv.TenantID, inv.CustomerID)
+		if err != nil {
+			// A failed read (a database error, or a missing
+			// VELOX_ENCRYPTION_KEY that fails every customer decrypt) is not
+			// "no card": an error, so the sweep logs and counts it. No card
+			// resolves to ("", "", nil). Nothing was sent; the release below
+			// frees the hold and the invoice stays queued.
+			errs = append(errs, fmt.Errorf("resolve payment method for invoice %s: %w", inv.ID, err))
+		}
 		if err != nil || stripePMID == "" || stripeCusID == "" {
 			// Genuinely no PM (not a resolve error) and never emailed: send
 			// the setup-link email ONCE (ADR-087 follow-up). This closes the
@@ -5300,12 +5406,12 @@ func (e *Engine) processAutoCharge(ctx context.Context, pending []domain.Invoice
 			// card is attached, settles it if credits arrive, retries an email
 			// that was skipped, and starts dunning once the tenant has a
 			// policy.
-			_ = e.invoices.ReleaseAutoChargeClaim(ctx, inv.TenantID, inv.ID)
+			release()
 			continue
 		}
 
 		chargeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if _, err := e.charger.ChargeInvoice(chargeCtx, inv.TenantID, inv, stripeCusID, stripePMID); err != nil {
+		if _, err := e.charger.ChargeInvoice(chargeCtx, inv.TenantID, inv, hold, stripeCusID, stripePMID); err != nil {
 			cancel()
 			// A DEFINITE failure (declined, or refused outright by Stripe):
 			// ChargeInvoice recorded payment_status='failed' AND started
@@ -5679,7 +5785,7 @@ func (e *Engine) cancelTrialAtEndFromEngine(ctx context.Context, sub domain.Subs
 	}
 	if e.auditLogger != nil {
 		meta := map[string]any{
-			"action":       "trial_end_cancel",
+			"action":       domain.SubAuditTrialEndCancel,
 			"customer_id":  canceled.CustomerID,
 			"triggered_by": "schedule",
 		}

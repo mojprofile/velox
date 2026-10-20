@@ -22,6 +22,7 @@ import (
 type scriptedCharges struct {
 	answers []scriptedCharge
 	charged []string // PaymentMethodID of every charge Stripe received
+	amounts []int64  // and its amount
 }
 
 type scriptedCharge struct {
@@ -31,6 +32,7 @@ type scriptedCharge struct {
 
 func (s *scriptedCharges) CreatePaymentIntent(_ context.Context, p payment.PaymentIntentParams) (payment.PaymentIntentResult, error) {
 	s.charged = append(s.charged, p.PaymentMethodID)
+	s.amounts = append(s.amounts, p.AmountCents)
 	if len(s.charged) > len(s.answers) {
 		return payment.PaymentIntentResult{}, errors.New("scriptedCharges: unexpected charge")
 	}
@@ -44,7 +46,7 @@ func (s *scriptedCharges) CancelPaymentIntent(context.Context, string) error { r
 func (s *scriptedCharges) GetPaymentIntent(_ context.Context, id string) (payment.PaymentIntentResult, error) {
 	return payment.PaymentIntentResult{ID: id, Status: "requires_payment_method"}, nil
 }
-func (s *scriptedCharges) SearchPaymentIntentsByInvoiceID(context.Context, string) ([]payment.PaymentIntentResult, error) {
+func (s *scriptedCharges) ListPaymentIntentsForCustomer(context.Context, string, time.Time) ([]payment.PaymentIntentResult, error) {
 	return nil, nil
 }
 
@@ -58,6 +60,7 @@ func stripeDeclined(pi, code, message string) error {
 
 type hardDeclineRig struct {
 	t         *testing.T
+	db        *postgres.DB
 	ctx       context.Context
 	tenantID  string
 	customers *customer.PostgresStore
@@ -75,7 +78,7 @@ func newHardDeclineRig(t *testing.T, name string) *hardDeclineRig {
 	db := testutil.SetupTestDB(t)
 	ctx, cancel := context.WithTimeout(postgres.WithLivemode(context.Background(), false), 60*time.Second)
 	t.Cleanup(cancel)
-	r := &hardDeclineRig{t: t, ctx: ctx, tenantID: testutil.CreateTestTenant(t, db, name)}
+	r := &hardDeclineRig{t: t, db: db, ctx: ctx, tenantID: testutil.CreateTestTenant(t, db, name)}
 	r.customers = customer.NewPostgresStore(db)
 	r.invoices = invoice.NewPostgresStore(db)
 	r.pmStripe = &pmCardStripe{}
@@ -117,6 +120,17 @@ func (r *hardDeclineRig) addCard(custID, pm string) paymentmethods.PaymentMethod
 		r.t.Fatalf("attach card %s: %v", pm, err)
 	}
 	return got
+}
+
+// chargeAsCycle charges the invoice the way the cycle's collector does: under
+// its own claim (ADR-127: a charge sends nothing without one).
+func (r *hardDeclineRig) chargeAsCycle(inv domain.Invoice, stripeCustomerID, pm string) (domain.Invoice, error) {
+	r.t.Helper()
+	hold, err := r.invoices.ClaimChargeForManualCollect(r.ctx, r.tenantID, inv.ID)
+	if err != nil || !hold.Held() {
+		r.t.Fatalf("claim: held=%v err=%v", hold.Held(), err)
+	}
+	return r.charger.ChargeInvoice(r.ctx, r.tenantID, inv, hold, stripeCustomerID, pm)
 }
 
 func (r *hardDeclineRig) finalizedInvoice(custID, num string) domain.Invoice {
@@ -191,7 +205,7 @@ func TestHardDecline_RetrySkipsTheRefusedCardUntilANewCardArrives_RealStore(t *t
 	}
 
 	// The cycle charge: Stripe refuses the card as lost.
-	if _, err := r.charger.ChargeInvoice(r.ctx, r.tenantID, inv, "cus_stripe_lost", "pm_lost"); err == nil {
+	if _, err := r.chargeAsCycle(inv, "cus_stripe_lost", "pm_lost"); err == nil {
 		t.Fatal("the lost-card charge returned no error")
 	}
 	if got := r.invoice(inv.ID); got.PaymentStatus != domain.PaymentFailed || got.StripePaymentIntentID != "pi_lost_1" {
@@ -259,7 +273,7 @@ func TestHardDecline_OrdinaryDeclineIsRetriedOnTheSameCard_RealStore(t *testing.
 		{err: stripeDeclined("pi_nsf_2", "insufficient_funds", "Your card has insufficient funds.")},
 	}
 
-	_, _ = r.charger.ChargeInvoice(r.ctx, r.tenantID, inv, "cus_stripe_nsf", "pm_nsf")
+	_, _ = r.chargeAsCycle(inv, "cus_stripe_nsf", "pm_nsf")
 	if code := r.attentionCode(inv.ID); code != "payment.declined" {
 		t.Errorf("attention %q, want payment.declined", code)
 	}
@@ -347,7 +361,7 @@ func TestHardDecline_CardAlreadySavedBesideReplacesTheRefusedDefault_RealStore(t
 		{err: stripeDeclined("pi_revoked_1", "revocation_of_authorization", "Your card was declined.")},
 		{pi: "pi_spare_paid"},
 	}
-	if _, err := r.charger.ChargeInvoice(r.ctx, r.tenantID, inv, "cus_stripe_revoked", "pm_revoked"); err == nil {
+	if _, err := r.chargeAsCycle(inv, "cus_stripe_revoked", "pm_revoked"); err == nil {
 		t.Fatal("the revoked-card charge returned no error")
 	}
 	// The refusal alone does not move the default: the card beside it was

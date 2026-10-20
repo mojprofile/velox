@@ -70,8 +70,10 @@ func NewDispatcher(outbox *OutboxStore, sender EmailDeliverer, cfg DispatcherCon
 	if cfg.BatchSize <= 0 {
 		// 5 rows/tick: with PerRowBudget=60s the invariant chain
 		// BatchSize×PerRowBudget ≤ BatchTimeout < ClaimLease holds as
-		// 300s ≤ 300s < 360s (P5 panel lease arithmetic). Throughput 5
-		// per 5s tick = 60/min — ample at current scale.
+		// 300s ≤ 300s < 360s (P5 panel lease arithmetic). Throughput is
+		// about 20-30/min on one replica, not 5 per 5s: a tick is due one
+		// interval after the last one ENDED, so a 5s poll leads every
+		// second poll, or every third when the sends take over 5s.
 		cfg.BatchSize = 5
 	}
 	if cfg.BatchTimeout <= 0 {
@@ -176,7 +178,8 @@ var actionRequiredTypes = map[string]bool{
 // handle is the per-row handler. It demarshals the payload based on
 // email_type and dispatches to the matching Send* method. Returning nil
 // marks the row 'dispatched'; returning an error schedules a retry (or DLQ
-// after MaxOutboxAttempts); returning ErrEmailObsolete marks it 'skipped';
+// after MaxOutboxAttempts); returning ErrEmailObsolete marks it 'skipped'
+// (an *ObsoleteError also records which state the invoice reached);
 // returning ErrUnknownEmailType (a type this binary has no case for)
 // schedules a retry so a newer replica can claim the row.
 func (d *Dispatcher) handle(ctx context.Context, row OutboxRow) error {
@@ -202,7 +205,7 @@ func (d *Dispatcher) handle(ctx context.Context, row OutboxRow) error {
 				"outbox_id", row.ID, "email_type", row.EmailType,
 				"invoice_number", msg.InvoiceNumber, "error", cerr)
 		} else if state != "" && !escalationAnnounces(row.EmailType, state) && !setupLinkServesRecovery(row.EmailType, state) {
-			return fmt.Errorf("%w: invoice %s reached %s before delivery", ErrEmailObsolete, msg.InvoiceNumber, state)
+			return &ObsoleteError{InvoiceNumber: msg.InvoiceNumber, State: state}
 		}
 	}
 

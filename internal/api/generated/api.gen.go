@@ -44,6 +44,93 @@ func (e APIKeyKeyType) Valid() bool {
 	}
 }
 
+// Defines values for ActivityActorKind.
+const (
+	ActivityActorKindApiKey    ActivityActorKind = "api_key"
+	ActivityActorKindAutomatic ActivityActorKind = "automatic"
+	ActivityActorKindCustomer  ActivityActorKind = "customer"
+	ActivityActorKindPerson    ActivityActorKind = "person"
+)
+
+// Valid indicates whether the value is a known member of the ActivityActorKind enum.
+func (e ActivityActorKind) Valid() bool {
+	switch e {
+	case ActivityActorKindApiKey:
+		return true
+	case ActivityActorKindAutomatic:
+		return true
+	case ActivityActorKindCustomer:
+		return true
+	case ActivityActorKindPerson:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ActivityActorVia.
+const (
+	PaymentPage ActivityActorVia = "payment_page"
+	Portal      ActivityActorVia = "portal"
+)
+
+// Valid indicates whether the value is a known member of the ActivityActorVia enum.
+func (e ActivityActorVia) Valid() bool {
+	switch e {
+	case PaymentPage:
+		return true
+	case Portal:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ActivityLineTone.
+const (
+	ActivityLineToneFailure ActivityLineTone = "failure"
+	ActivityLineToneNeutral ActivityLineTone = "neutral"
+	ActivityLineToneSuccess ActivityLineTone = "success"
+	ActivityLineToneWarning ActivityLineTone = "warning"
+)
+
+// Valid indicates whether the value is a known member of the ActivityLineTone enum.
+func (e ActivityLineTone) Valid() bool {
+	switch e {
+	case ActivityLineToneFailure:
+		return true
+	case ActivityLineToneNeutral:
+		return true
+	case ActivityLineToneSuccess:
+		return true
+	case ActivityLineToneWarning:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ActivityLinkKind.
+const (
+	ActivityLinkKindCreditNote   ActivityLinkKind = "credit_note"
+	ActivityLinkKindInvoice      ActivityLinkKind = "invoice"
+	ActivityLinkKindSubscription ActivityLinkKind = "subscription"
+)
+
+// Valid indicates whether the value is a known member of the ActivityLinkKind enum.
+func (e ActivityLinkKind) Valid() bool {
+	switch e {
+	case ActivityLinkKindCreditNote:
+		return true
+	case ActivityLinkKindInvoice:
+		return true
+	case ActivityLinkKindSubscription:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for AnalyticsPeriod.
 const (
 	N12m AnalyticsPeriod = "12m"
@@ -127,6 +214,7 @@ const (
 	AttentionReasonAwaitingPayment      AttentionReason = "awaiting_payment"
 	AttentionReasonCollectionPaused     AttentionReason = "collection_paused"
 	AttentionReasonCommitExposure       AttentionReason = "commit_exposure"
+	AttentionReasonDisputeLost          AttentionReason = "dispute_lost"
 	AttentionReasonDunningExhausted     AttentionReason = "dunning_exhausted"
 	AttentionReasonNoPaymentMethod      AttentionReason = "no_payment_method"
 	AttentionReasonPaymentAnomaly       AttentionReason = "payment_anomaly"
@@ -146,6 +234,8 @@ func (e AttentionReason) Valid() bool {
 	case AttentionReasonCollectionPaused:
 		return true
 	case AttentionReasonCommitExposure:
+		return true
+	case AttentionReasonDisputeLost:
 		return true
 	case AttentionReasonDunningExhausted:
 		return true
@@ -172,19 +262,19 @@ func (e AttentionReason) Valid() bool {
 
 // Defines values for AttentionSeverity.
 const (
-	Critical AttentionSeverity = "critical"
-	Info     AttentionSeverity = "info"
-	Warning  AttentionSeverity = "warning"
+	AttentionSeverityCritical AttentionSeverity = "critical"
+	AttentionSeverityInfo     AttentionSeverity = "info"
+	AttentionSeverityWarning  AttentionSeverity = "warning"
 )
 
 // Valid indicates whether the value is a known member of the AttentionSeverity enum.
 func (e AttentionSeverity) Valid() bool {
 	switch e {
-	case Critical:
+	case AttentionSeverityCritical:
 		return true
-	case Info:
+	case AttentionSeverityInfo:
 		return true
-	case Warning:
+	case AttentionSeverityWarning:
 		return true
 	default:
 		return false
@@ -193,19 +283,19 @@ func (e AttentionSeverity) Valid() bool {
 
 // Defines values for AuditLogEntryActorType.
 const (
-	ApiKey AuditLogEntryActorType = "api_key"
-	System AuditLogEntryActorType = "system"
-	User   AuditLogEntryActorType = "user"
+	AuditLogEntryActorTypeApiKey AuditLogEntryActorType = "api_key"
+	AuditLogEntryActorTypeSystem AuditLogEntryActorType = "system"
+	AuditLogEntryActorTypeUser   AuditLogEntryActorType = "user"
 )
 
 // Valid indicates whether the value is a known member of the AuditLogEntryActorType enum.
 func (e AuditLogEntryActorType) Valid() bool {
 	switch e {
-	case ApiKey:
+	case AuditLogEntryActorTypeApiKey:
 		return true
-	case System:
+	case AuditLogEntryActorTypeSystem:
 		return true
-	case User:
+	case AuditLogEntryActorTypeUser:
 		return true
 	default:
 		return false
@@ -278,6 +368,7 @@ const (
 	CreditNoteRefundStatusNone      CreditNoteRefundStatus = "none"
 	CreditNoteRefundStatusPending   CreditNoteRefundStatus = "pending"
 	CreditNoteRefundStatusSucceeded CreditNoteRefundStatus = "succeeded"
+	CreditNoteRefundStatusUnknown   CreditNoteRefundStatus = "unknown"
 )
 
 // Valid indicates whether the value is a known member of the CreditNoteRefundStatus enum.
@@ -290,6 +381,8 @@ func (e CreditNoteRefundStatus) Valid() bool {
 	case CreditNoteRefundStatusPending:
 		return true
 	case CreditNoteRefundStatusSucceeded:
+		return true
+	case CreditNoteRefundStatusUnknown:
 		return true
 	default:
 		return false
@@ -650,6 +743,33 @@ func (e DunningRunState) Valid() bool {
 	}
 }
 
+// Defines values for DunningRunDetailDegraded.
+const (
+	DunningRunDetailDegradedAudit          DunningRunDetailDegraded = "audit"
+	DunningRunDetailDegradedChargeAttempts DunningRunDetailDegraded = "charge_attempts"
+	DunningRunDetailDegradedEmails         DunningRunDetailDegraded = "emails"
+	DunningRunDetailDegradedEvents         DunningRunDetailDegraded = "events"
+	DunningRunDetailDegradedInvoice        DunningRunDetailDegraded = "invoice"
+)
+
+// Valid indicates whether the value is a known member of the DunningRunDetailDegraded enum.
+func (e DunningRunDetailDegraded) Valid() bool {
+	switch e {
+	case DunningRunDetailDegradedAudit:
+		return true
+	case DunningRunDetailDegradedChargeAttempts:
+		return true
+	case DunningRunDetailDegradedEmails:
+		return true
+	case DunningRunDetailDegradedEvents:
+		return true
+	case DunningRunDetailDegradedInvoice:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for DunningRunEventEventType.
 const (
 	DunningRunEventEventTypeDunningStarted DunningRunEventEventType = "dunning_started"
@@ -776,6 +896,42 @@ func (e InvoiceBillingReason) Valid() bool {
 	}
 }
 
+// Defines values for InvoiceDisputeStatus.
+const (
+	Lost                 InvoiceDisputeStatus = "lost"
+	NeedsResponse        InvoiceDisputeStatus = "needs_response"
+	Prevented            InvoiceDisputeStatus = "prevented"
+	UnderReview          InvoiceDisputeStatus = "under_review"
+	WarningClosed        InvoiceDisputeStatus = "warning_closed"
+	WarningNeedsResponse InvoiceDisputeStatus = "warning_needs_response"
+	WarningUnderReview   InvoiceDisputeStatus = "warning_under_review"
+	Won                  InvoiceDisputeStatus = "won"
+)
+
+// Valid indicates whether the value is a known member of the InvoiceDisputeStatus enum.
+func (e InvoiceDisputeStatus) Valid() bool {
+	switch e {
+	case Lost:
+		return true
+	case NeedsResponse:
+		return true
+	case Prevented:
+		return true
+	case UnderReview:
+		return true
+	case WarningClosed:
+		return true
+	case WarningNeedsResponse:
+		return true
+	case WarningUnderReview:
+		return true
+	case Won:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for InvoiceLineItemInputLineType.
 const (
 	InvoiceLineItemInputLineTypeAddOn    InvoiceLineItemInputLineType = "add_on"
@@ -862,6 +1018,7 @@ const (
 	InvoicePaymentTimelineDegradedAudit          InvoicePaymentTimelineDegraded = "audit"
 	InvoicePaymentTimelineDegradedChargeAttempts InvoicePaymentTimelineDegraded = "charge_attempts"
 	InvoicePaymentTimelineDegradedCreditNotes    InvoicePaymentTimelineDegraded = "credit_notes"
+	InvoicePaymentTimelineDegradedDisputes       InvoicePaymentTimelineDegraded = "disputes"
 	InvoicePaymentTimelineDegradedDunning        InvoicePaymentTimelineDegraded = "dunning"
 	InvoicePaymentTimelineDegradedEmails         InvoicePaymentTimelineDegraded = "emails"
 )
@@ -874,6 +1031,8 @@ func (e InvoicePaymentTimelineDegraded) Valid() bool {
 	case InvoicePaymentTimelineDegradedChargeAttempts:
 		return true
 	case InvoicePaymentTimelineDegradedCreditNotes:
+		return true
+	case InvoicePaymentTimelineDegradedDisputes:
 		return true
 	case InvoicePaymentTimelineDegradedDunning:
 		return true
@@ -974,6 +1133,7 @@ func (e InvoiceTaxStatus) Valid() bool {
 // Defines values for InvoiceTimelineEventSource.
 const (
 	InvoiceTimelineEventSourceCreditNote InvoiceTimelineEventSource = "credit_note"
+	InvoiceTimelineEventSourceDispute    InvoiceTimelineEventSource = "dispute"
 	InvoiceTimelineEventSourceDunning    InvoiceTimelineEventSource = "dunning"
 	InvoiceTimelineEventSourceEmail      InvoiceTimelineEventSource = "email"
 	InvoiceTimelineEventSourceLifecycle  InvoiceTimelineEventSource = "lifecycle"
@@ -985,6 +1145,8 @@ func (e InvoiceTimelineEventSource) Valid() bool {
 	switch e {
 	case InvoiceTimelineEventSourceCreditNote:
 		return true
+	case InvoiceTimelineEventSourceDispute:
+		return true
 	case InvoiceTimelineEventSourceDunning:
 		return true
 	case InvoiceTimelineEventSourceEmail:
@@ -992,6 +1154,30 @@ func (e InvoiceTimelineEventSource) Valid() bool {
 	case InvoiceTimelineEventSourceLifecycle:
 		return true
 	case InvoiceTimelineEventSourcePayment:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InvoiceTimelineEventStatus.
+const (
+	InvoiceTimelineEventStatusFailed    InvoiceTimelineEventStatus = "failed"
+	InvoiceTimelineEventStatusNeutral   InvoiceTimelineEventStatus = "neutral"
+	InvoiceTimelineEventStatusSucceeded InvoiceTimelineEventStatus = "succeeded"
+	InvoiceTimelineEventStatusWarning   InvoiceTimelineEventStatus = "warning"
+)
+
+// Valid indicates whether the value is a known member of the InvoiceTimelineEventStatus enum.
+func (e InvoiceTimelineEventStatus) Valid() bool {
+	switch e {
+	case InvoiceTimelineEventStatusFailed:
+		return true
+	case InvoiceTimelineEventStatusNeutral:
+		return true
+	case InvoiceTimelineEventStatusSucceeded:
+		return true
+	case InvoiceTimelineEventStatusWarning:
 		return true
 	default:
 		return false
@@ -1381,22 +1567,22 @@ func (e RecoveryWarningCode) Valid() bool {
 
 // Defines values for SentEmailDeliveryState.
 const (
-	Bounced    SentEmailDeliveryState = "bounced"
-	Complained SentEmailDeliveryState = "complained"
-	Delivered  SentEmailDeliveryState = "delivered"
-	Unknown    SentEmailDeliveryState = "unknown"
+	SentEmailDeliveryStateBounced    SentEmailDeliveryState = "bounced"
+	SentEmailDeliveryStateComplained SentEmailDeliveryState = "complained"
+	SentEmailDeliveryStateDelivered  SentEmailDeliveryState = "delivered"
+	SentEmailDeliveryStateUnknown    SentEmailDeliveryState = "unknown"
 )
 
 // Valid indicates whether the value is a known member of the SentEmailDeliveryState enum.
 func (e SentEmailDeliveryState) Valid() bool {
 	switch e {
-	case Bounced:
+	case SentEmailDeliveryStateBounced:
 		return true
-	case Complained:
+	case SentEmailDeliveryStateComplained:
 		return true
-	case Delivered:
+	case SentEmailDeliveryStateDelivered:
 		return true
-	case Unknown:
+	case SentEmailDeliveryStateUnknown:
 		return true
 	default:
 		return false
@@ -1574,6 +1760,30 @@ func (e SubscriptionTimelineEventSource) Valid() bool {
 	}
 }
 
+// Defines values for SubscriptionTimelineEventStatus.
+const (
+	SubscriptionTimelineEventStatusFailed    SubscriptionTimelineEventStatus = "failed"
+	SubscriptionTimelineEventStatusNeutral   SubscriptionTimelineEventStatus = "neutral"
+	SubscriptionTimelineEventStatusSucceeded SubscriptionTimelineEventStatus = "succeeded"
+	SubscriptionTimelineEventStatusWarning   SubscriptionTimelineEventStatus = "warning"
+)
+
+// Valid indicates whether the value is a known member of the SubscriptionTimelineEventStatus enum.
+func (e SubscriptionTimelineEventStatus) Valid() bool {
+	switch e {
+	case SubscriptionTimelineEventStatusFailed:
+		return true
+	case SubscriptionTimelineEventStatusNeutral:
+		return true
+	case SubscriptionTimelineEventStatusSucceeded:
+		return true
+	case SubscriptionTimelineEventStatusWarning:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for TenantStatus.
 const (
 	TenantStatusActive    TenantStatus = "active"
@@ -1675,19 +1885,19 @@ func (e TenantSettingsInputTaxProvider) Valid() bool {
 
 // Defines values for TestClockStatus.
 const (
-	TestClockStatusAdvancing       TestClockStatus = "advancing"
-	TestClockStatusInternalFailure TestClockStatus = "internal_failure"
-	TestClockStatusReady           TestClockStatus = "ready"
+	Advancing       TestClockStatus = "advancing"
+	InternalFailure TestClockStatus = "internal_failure"
+	Ready           TestClockStatus = "ready"
 )
 
 // Valid indicates whether the value is a known member of the TestClockStatus enum.
 func (e TestClockStatus) Valid() bool {
 	switch e {
-	case TestClockStatusAdvancing:
+	case Advancing:
 		return true
-	case TestClockStatusInternalFailure:
+	case InternalFailure:
 		return true
-	case TestClockStatusReady:
+	case Ready:
 		return true
 	default:
 		return false
@@ -1792,19 +2002,19 @@ func (e WebhookEndpointDeliveryStatus) Valid() bool {
 
 // Defines values for WebhookEventDeliveryAttemptStatus.
 const (
-	WebhookEventDeliveryAttemptStatusFailed    WebhookEventDeliveryAttemptStatus = "failed"
-	WebhookEventDeliveryAttemptStatusPending   WebhookEventDeliveryAttemptStatus = "pending"
-	WebhookEventDeliveryAttemptStatusSucceeded WebhookEventDeliveryAttemptStatus = "succeeded"
+	Failed    WebhookEventDeliveryAttemptStatus = "failed"
+	Pending   WebhookEventDeliveryAttemptStatus = "pending"
+	Succeeded WebhookEventDeliveryAttemptStatus = "succeeded"
 )
 
 // Valid indicates whether the value is a known member of the WebhookEventDeliveryAttemptStatus enum.
 func (e WebhookEventDeliveryAttemptStatus) Valid() bool {
 	switch e {
-	case WebhookEventDeliveryAttemptStatusFailed:
+	case Failed:
 		return true
-	case WebhookEventDeliveryAttemptStatusPending:
+	case Pending:
 		return true
-	case WebhookEventDeliveryAttemptStatusSucceeded:
+	case Succeeded:
 		return true
 	default:
 		return false
@@ -1971,6 +2181,7 @@ const (
 	ListCreditNotesParamsRefundStatusNone           ListCreditNotesParamsRefundStatus = "none"
 	ListCreditNotesParamsRefundStatusPending        ListCreditNotesParamsRefundStatus = "pending"
 	ListCreditNotesParamsRefundStatusSucceeded      ListCreditNotesParamsRefundStatus = "succeeded"
+	ListCreditNotesParamsRefundStatusUnknown        ListCreditNotesParamsRefundStatus = "unknown"
 )
 
 // Valid indicates whether the value is a known member of the ListCreditNotesParamsRefundStatus enum.
@@ -1985,6 +2196,8 @@ func (e ListCreditNotesParamsRefundStatus) Valid() bool {
 	case ListCreditNotesParamsRefundStatusPending:
 		return true
 	case ListCreditNotesParamsRefundStatusSucceeded:
+		return true
+	case ListCreditNotesParamsRefundStatusUnknown:
 		return true
 	default:
 		return false
@@ -2590,19 +2803,19 @@ func (e GetEmailSettings200JSONResponseBodyLinksEnv) Valid() bool {
 
 // Defines values for GetEmailSettings200JSONResponseBodyTlsMode.
 const (
-	GetEmailSettings200JSONResponseBodyTlsModeImplicit GetEmailSettings200JSONResponseBodyTlsMode = "implicit"
-	GetEmailSettings200JSONResponseBodyTlsModeNone     GetEmailSettings200JSONResponseBodyTlsMode = "none"
-	GetEmailSettings200JSONResponseBodyTlsModeStarttls GetEmailSettings200JSONResponseBodyTlsMode = "starttls"
+	Implicit GetEmailSettings200JSONResponseBodyTlsMode = "implicit"
+	None     GetEmailSettings200JSONResponseBodyTlsMode = "none"
+	Starttls GetEmailSettings200JSONResponseBodyTlsMode = "starttls"
 )
 
 // Valid indicates whether the value is a known member of the GetEmailSettings200JSONResponseBodyTlsMode enum.
 func (e GetEmailSettings200JSONResponseBodyTlsMode) Valid() bool {
 	switch e {
-	case GetEmailSettings200JSONResponseBodyTlsModeImplicit:
+	case Implicit:
 		return true
-	case GetEmailSettings200JSONResponseBodyTlsModeNone:
+	case None:
 		return true
-	case GetEmailSettings200JSONResponseBodyTlsModeStarttls:
+	case Starttls:
 		return true
 	default:
 		return false
@@ -2892,6 +3105,91 @@ type APIKeyRotation struct {
 	RawKey string `json:"raw_key"`
 }
 
+// ActivityActor Who did it. `person` and `api_key` carry the name (a person's email
+// when they have no name), `customer` says where through `via`, and
+// `automatic` is anything Velox did on its own. Absent when no fact
+// written with the row names one.
+type ActivityActor struct {
+	Kind ActivityActorKind `json:"kind"`
+	Name string            `json:"name,omitempty"`
+	Via  ActivityActorVia  `json:"via,omitempty"`
+}
+
+// ActivityActorKind defines model for ActivityActor.Kind.
+type ActivityActorKind string
+
+// ActivityActorVia defines model for ActivityActor.Via.
+type ActivityActorVia string
+
+// ActivityLine One activity row in the words of the activity line standard
+// (ADR-128): a title with no values, the amount when the event moves
+// money, asks for it or cancels money owed, a problem line on failure
+// and warning rows, the meta line's parts and the actor, a tone, and
+// the event's time on the entity's calendar. `recorded_at` is the
+// real-world time, set only for an entity on a test clock.
+type ActivityLine struct {
+	// Actor Who did it. `person` and `api_key` carry the name (a person's email
+	// when they have no name), `customer` says where through `via`, and
+	// `automatic` is anything Velox did on its own. Absent when no fact
+	// written with the row names one.
+	Actor  ActivityActor `json:"actor,omitempty"`
+	Amount ActivityMoney `json:"amount,omitempty"`
+
+	// Detail The meta line before the actor. Each item is one segment, shown
+	// joined by " · "; a segment's parts read as one phrase, for
+	// example a money part followed by the text " refunded to card".
+	Detail [][]ActivityPart `json:"detail"`
+
+	// Id The row's stable key: the event's `id` on an invoice timeline
+	// row, the audit entry's id on a subscription timeline row,
+	// `dunning:` and the event's id on a dunning run event (the same
+	// key the invoice timeline gives that event), and `email:` and
+	// the email's id on a sent email (likewise).
+	Id string `json:"id"`
+
+	// Kind Machine name of the event.
+	Kind       string    `json:"kind"`
+	OccurredAt time.Time `json:"occurred_at"`
+	Problem    string    `json:"problem,omitempty"`
+	RecordedAt time.Time `json:"recorded_at,omitempty"`
+	Title      string    `json:"title"`
+
+	// Tone neutral: something happened. success: money arrived, or was
+	// returned as intended. warning: needs a look, or money will not
+	// be collected. failure: an attempt failed.
+	Tone ActivityLineTone `json:"tone"`
+}
+
+// ActivityLineTone neutral: something happened. success: money arrived, or was
+// returned as intended. warning: needs a look, or money will not
+// be collected. failure: an attempt failed.
+type ActivityLineTone string
+
+// ActivityLink An object the row's own data names, which still exists.
+type ActivityLink struct {
+	Id    string           `json:"id"`
+	Kind  ActivityLinkKind `json:"kind"`
+	Label string           `json:"label"`
+}
+
+// ActivityLinkKind defines model for ActivityLink.Kind.
+type ActivityLinkKind string
+
+// ActivityMoney defines model for ActivityMoney.
+type ActivityMoney struct {
+	Cents    int64  `json:"cents"`
+	Currency string `json:"currency"`
+}
+
+// ActivityPart One piece of a meta segment. Exactly one field is set.
+type ActivityPart struct {
+	// Link An object the row's own data names, which still exists.
+	Link  ActivityLink  `json:"link,omitempty"`
+	Money ActivityMoney `json:"money,omitempty"`
+	Text  string        `json:"text,omitempty"`
+	Time  time.Time     `json:"time,omitempty"`
+}
+
 // AnalyticsMrrMovementPoint defines model for AnalyticsMrrMovementPoint.
 type AnalyticsMrrMovementPoint struct {
 	Churned     int64 `json:"churned"`
@@ -2999,17 +3297,18 @@ type AnalyticsOverview struct {
 	PaidInvoices int             `json:"paid_invoices"`
 	Period       AnalyticsPeriod `json:"period"`
 
-	// RefundsNeedingAttention Issued credit notes whose refund failed, has been pending for
-	// more than 72 hours, or has not started an hour after issue.
+	// RefundsNeedingAttention Issued credit notes whose refund failed, has an unknown result,
+	// has been pending for more than 72 hours, or has not started an
+	// hour after issue.
 	RefundsNeedingAttention int `json:"refunds_needing_attention"`
 
-	// Revenue Total of invoices paid in the window.
+	// Revenue What paid the invoices paid in the window (payment plus customer credit applied). A credit note that lowered an invoice before it was paid is not counted.
 	Revenue int64 `json:"revenue"`
 
 	// RevenueChurnRate Churned MRR divided by `mrr_prev`. 0 when `mrr_prev` is 0.
 	RevenueChurnRate float64 `json:"revenue_churn_rate"`
 
-	// RevenuePrev Total of invoices paid in the previous window.
+	// RevenuePrev `revenue` for the previous window.
 	RevenuePrev int64 `json:"revenue_prev"`
 
 	// TrialingSubscriptions Subscriptions with status `trialing`.
@@ -3028,7 +3327,7 @@ type AnalyticsRevenuePoint struct {
 	Date         string `json:"date"`
 	InvoiceCount int    `json:"invoice_count"`
 
-	// RevenueCents Sum of invoice totals paid in the bucket.
+	// RevenueCents What paid the invoices paid in the bucket (payment plus customer credit applied). A credit note that lowered an invoice before it was paid is not counted.
 	RevenueCents int64 `json:"revenue_cents"`
 }
 
@@ -3134,7 +3433,17 @@ type Attention struct {
 	// reason applies; when one does, the exposure is folded into that
 	// reason's `message` and its `actions` instead, so clients must
 	// not treat the reason code as the presence test for exposure
-	// (2026-08-04).
+	// (2026-08-04). `dispute_lost` reports a payment on the invoice that
+	// the customer disputed with their bank and that the dispute took
+	// back (the dispute closed as `lost`). Velox leaves the invoice paid
+	// and moves no money; the operator records the loss. Surfaced on paid
+	// invoices. On an invoice that bought prepaid credit, the message
+	// also says how much of the credit is still spendable and names
+	// commit relief, because an ordinary credit note is refused there.
+	// When the invoice also has `payment_anomaly`, that reason stays and
+	// its message asks the operator to check Stripe before any refund.
+	// The disputes themselves are at `GET /v1/invoices/{id}/disputes`
+	// (2026-10-19).
 	Reason AttentionReason `json:"reason"`
 
 	// Severity Urgency of an Attention surface. Operators sort/filter on this
@@ -3153,9 +3462,11 @@ type Attention struct {
 // and audit logs key off the code. `reconcile_payment` opens the
 // payment in Stripe; it is offered on `payment_anomaly`, where the
 // refund or correction is made there. `mark_uncollectible` opens
-// the write-off and is offered only when a payment's outcome can
-// never be identified (payment status unknown with no payment
-// intent recorded). `void_invoice` is offered only
+// the write-off and is offered only on a parked invoice (payment
+// status unknown with no payment intent recorded), for a customer
+// who paid another way: Velox records a payment that Stripe shows,
+// and charges the invoice again if none appears within 24 hours.
+// Dashboards render it as a secondary action. `void_invoice` is offered only
 // on prepaid-commit exposure, and only while some of the granted
 // credit is still unspent: voiding retires the unspent balance
 // (ADR-078) and is the sole recovery for an unpaid invoice whose
@@ -3170,9 +3481,11 @@ type AttentionActionItem struct {
 	// and audit logs key off the code. `reconcile_payment` opens the
 	// payment in Stripe; it is offered on `payment_anomaly`, where the
 	// refund or correction is made there. `mark_uncollectible` opens
-	// the write-off and is offered only when a payment's outcome can
-	// never be identified (payment status unknown with no payment
-	// intent recorded). `void_invoice` is offered only
+	// the write-off and is offered only on a parked invoice (payment
+	// status unknown with no payment intent recorded), for a customer
+	// who paid another way: Velox records a payment that Stripe shows,
+	// and charges the invoice again if none appears within 24 hours.
+	// Dashboards render it as a secondary action. `void_invoice` is offered only
 	// on prepaid-commit exposure, and only while some of the granted
 	// credit is still unspent: voiding retires the unspent balance
 	// (ADR-078) and is the sole recovery for an unpaid invoice whose
@@ -3205,7 +3518,17 @@ type AttentionActionItem struct {
 // reason applies; when one does, the exposure is folded into that
 // reason's `message` and its `actions` instead, so clients must
 // not treat the reason code as the presence test for exposure
-// (2026-08-04).
+// (2026-08-04). `dispute_lost` reports a payment on the invoice that
+// the customer disputed with their bank and that the dispute took
+// back (the dispute closed as `lost`). Velox leaves the invoice paid
+// and moves no money; the operator records the loss. Surfaced on paid
+// invoices. On an invoice that bought prepaid credit, the message
+// also says how much of the credit is still spendable and names
+// commit relief, because an ordinary credit note is refused there.
+// When the invoice also has `payment_anomaly`, that reason stays and
+// its message asks the operator to check Stripe before any refund.
+// The disputes themselves are at `GET /v1/invoices/{id}/disputes`
+// (2026-10-19).
 type AttentionReason string
 
 // AttentionSeverity Urgency of an Attention surface. Operators sort/filter on this
@@ -3494,12 +3817,20 @@ type CreditNote struct {
 	Reason               string                 `json:"reason"`
 
 	// RecordedAt Real-world time the row was written, when `created_at` is test-clock time.
-	RecordedAt        time.Time              `json:"recorded_at,omitempty"`
-	RefundAmountCents int64                  `json:"refund_amount_cents"`
-	RefundStatus      CreditNoteRefundStatus `json:"refund_status"`
-	Status            CreditNoteStatus       `json:"status"`
-	StripeRefundId    string                 `json:"stripe_refund_id,omitempty"`
-	SubtotalCents     int64                  `json:"subtotal_cents"`
+	RecordedAt        time.Time `json:"recorded_at,omitempty"`
+	RefundAmountCents int64     `json:"refund_amount_cents"`
+
+	// RefundStatus The refund part's state at Stripe. `unknown`: Stripe gave no
+	// clear answer (a timeout, a network error, a Stripe 5xx, a 409 or
+	// a 429), so the customer may already be refunded. Don't refund it
+	// again in the Stripe Dashboard. Retry it with
+	// `POST /v1/credit-notes/{id}/retry-refund`, which looks for the
+	// refund at Stripe first and then resends the same request with
+	// the same idempotency key.
+	RefundStatus   CreditNoteRefundStatus `json:"refund_status"`
+	Status         CreditNoteStatus       `json:"status"`
+	StripeRefundId string                 `json:"stripe_refund_id,omitempty"`
+	SubtotalCents  int64                  `json:"subtotal_cents"`
 
 	// SupplierSnapshot What an issued invoice or credit note prints about its seller (the
 	// tenant's company), copied when the document was issued (ADR-109).
@@ -3517,7 +3848,13 @@ type CreditNote struct {
 	VoidedAt         time.Time `json:"voided_at,omitempty"`
 }
 
-// CreditNoteRefundStatus defines model for CreditNote.RefundStatus.
+// CreditNoteRefundStatus The refund part's state at Stripe. `unknown`: Stripe gave no
+// clear answer (a timeout, a network error, a Stripe 5xx, a 409 or
+// a 429), so the customer may already be refunded. Don't refund it
+// again in the Stripe Dashboard. Retry it with
+// `POST /v1/credit-notes/{id}/retry-refund`, which looks for the
+// refund at Stripe first and then resends the same request with
+// the same idempotency key.
 type CreditNoteRefundStatus string
 
 // CreditNoteStatus defines model for CreditNote.Status.
@@ -3806,6 +4143,44 @@ type CustomerUsageMeter struct {
 	Unit          string `json:"unit"`
 }
 
+// DisputeWebhookEventData The `data` of the outbound webhook events `payment.dispute_opened`
+// and `payment.dispute_closed` (docs/webhooks.md). Both are saved in the
+// same transaction that records the dispute, so a crash cannot drop
+// them. `payment.dispute_opened` is sent once per dispute, when Velox
+// first records it; if the first event Velox receives is already the
+// close, both are sent, and both carry the closed status and
+// `closed_at`. Their delivery order is not guaranteed.
+// `payment.dispute_closed` is sent when the dispute reaches a closed
+// status it did not have: `won`, `lost`, `warning_closed` or
+// `prevented`. A lost dispute that Stripe later marks won sends it
+// again.
+type DisputeWebhookEventData struct {
+	AmountCents int64 `json:"amount_cents"`
+
+	// ClosedAt Set when the dispute is closed: always on `payment.dispute_closed`,
+	// and on `payment.dispute_opened` when the first event Velox received
+	// was already the close.
+	ClosedAt   time.Time `json:"closed_at,omitempty"`
+	Currency   string    `json:"currency"`
+	CustomerId string    `json:"customer_id"`
+
+	// DisputeId The Velox dispute record (`InvoiceDispute.id`).
+	DisputeId     string    `json:"dispute_id"`
+	EvidenceDueBy time.Time `json:"evidence_due_by,omitempty"`
+	InvoiceId     string    `json:"invoice_id"`
+	InvoiceNumber string    `json:"invoice_number"`
+	OpenedAt      time.Time `json:"opened_at"`
+
+	// PaymentIntentId The disputed Stripe PaymentIntent.
+	PaymentIntentId string `json:"payment_intent_id"`
+	Reason          string `json:"reason,omitempty"`
+
+	// Status The dispute's status when the event was saved (see `InvoiceDispute.status`).
+	Status          string `json:"status"`
+	StripeChargeId  string `json:"stripe_charge_id,omitempty"`
+	StripeDisputeId string `json:"stripe_dispute_id"`
+}
+
 // DocumentBillTo What an issued invoice or credit note prints about its buyer, copied
 // when the document was issued (ADR-109). The printed name is
 // `legal_name` when set, otherwise `display_name`.
@@ -3985,9 +4360,19 @@ type DunningRunState string
 
 // DunningRunDetail defines model for DunningRunDetail.
 type DunningRunDetail struct {
-	Events []DunningRunEvent `json:"events"`
-	Run    DunningRun        `json:"run"`
+	// Degraded Sources that could not be read. `events`: the event history, so
+	// `events` is empty. `invoice`: the run's invoice, so no event has
+	// a `line`. The others leave the lines without what they would
+	// add: `emails` the reminder and final-notice clauses,
+	// `charge_attempts` the decline reason and amount, `audit` who
+	// resolved the run.
+	Degraded []DunningRunDetailDegraded `json:"degraded"`
+	Events   []DunningRunEvent          `json:"events"`
+	Run      DunningRun                 `json:"run"`
 }
+
+// DunningRunDetailDegraded defines model for DunningRunDetail.Degraded.
+type DunningRunDetailDegraded string
 
 // DunningRunEvent defines model for DunningRunEvent.
 type DunningRunEvent struct {
@@ -3996,12 +4381,18 @@ type DunningRunEvent struct {
 	EventType    DunningRunEventEventType `json:"event_type"`
 	Id           string                   `json:"id"`
 	InvoiceId    string                   `json:"invoice_id"`
-	Metadata     map[string]interface{}   `json:"metadata,omitempty"`
-	Reason       string                   `json:"reason,omitempty"`
-	RecordedAt   time.Time                `json:"recorded_at,omitempty"`
-	RunId        string                   `json:"run_id"`
-	State        DunningRunEventState     `json:"state"`
-	TenantId     string                   `json:"tenant_id,omitempty"`
+
+	// Line The event in the words of the activity line standard (ADR-128):
+	// the line the invoice's payment timeline shows for the same
+	// event, without that timeline's folds. Absent when the run's
+	// invoice could not be read (`degraded` names `invoice`).
+	Line       ActivityLine           `json:"line,omitempty"`
+	Metadata   map[string]interface{} `json:"metadata,omitempty"`
+	Reason     string                 `json:"reason,omitempty"`
+	RecordedAt time.Time              `json:"recorded_at,omitempty"`
+	RunId      string                 `json:"run_id"`
+	State      DunningRunEventState   `json:"state"`
+	TenantId   string                 `json:"tenant_id,omitempty"`
 }
 
 // DunningRunEventEventType defines model for DunningRunEvent.EventType.
@@ -4165,8 +4556,13 @@ type HostedInvoice struct {
 
 		// PaymentStatus Payment-attempt status. `unknown` marks a Stripe charge attempt that
 		// returned an ambiguous error (5xx, timeout, connection reset) where
-		// we cannot tell whether Stripe processed the charge — a reconciler
-		// resolves these by querying Stripe after a cool-off window.
+		// we cannot tell whether Stripe processed the charge. With a payment
+		// intent recorded, Velox asks Stripe for it after a short wait. With
+		// none (a parked invoice), Velox lists the customer's payments at
+		// Stripe every billing tick: it records a payment for the invoice that
+		// appears, and if none has appeared 24 hours after the attempt the
+		// invoice goes back to `pending` (`failed` after a dunning retry) and
+		// is charged again as usual.
 		PaymentStatus InvoicePaymentStatus `json:"payment_status"`
 
 		// Status Lifecycle state of the invoice. `uncollectible` marks an invoice
@@ -4306,16 +4702,26 @@ type Invoice struct {
 
 	// PaymentStatus Payment-attempt status. `unknown` marks a Stripe charge attempt that
 	// returned an ambiguous error (5xx, timeout, connection reset) where
-	// we cannot tell whether Stripe processed the charge — a reconciler
-	// resolves these by querying Stripe after a cool-off window.
+	// we cannot tell whether Stripe processed the charge. With a payment
+	// intent recorded, Velox asks Stripe for it after a short wait. With
+	// none (a parked invoice), Velox lists the customer's payments at
+	// Stripe every billing tick: it records a payment for the invoice that
+	// appears, and if none has appeared 24 hours after the attempt the
+	// invoice goes back to `pending` (`failed` after a dunning retry) and
+	// is charged again as usual.
 	PaymentStatus InvoicePaymentStatus `json:"payment_status"`
 
 	// ProviderPaymentStatus Stripe's PaymentIntent status the last time Velox checked it,
 	// word for word. For information only: `payment_status` is the
-	// invoice's payment state. Absent until Velox has checked.
+	// invoice's payment state. Absent until Velox has checked. An
+	// invoice checked by the Stripe Search sweep of releases before
+	// this one may still show `search_not_found`,
+	// `search_terminal_only` or `search_error`.
 	ProviderPaymentStatus string `json:"provider_payment_status,omitempty"`
 
-	// ProviderSyncedAt When Velox last checked `provider_payment_status`.
+	// ProviderSyncedAt When Velox last asked Stripe about this invoice's payment, whether
+	// or not Stripe answered: a read of `provider_payment_status`, or a
+	// check of a charge whose result was lost.
 	ProviderSyncedAt time.Time `json:"provider_synced_at,omitempty"`
 
 	// PublicToken Hosted-invoice-URL credential (Stripe-parity
@@ -4446,6 +4852,57 @@ type InvoiceCreateRequest struct {
 	SubscriptionId string `json:"subscription_id,omitempty"`
 }
 
+// InvoiceDispute A card dispute (chargeback) Stripe reported against one of the
+// invoice's payments, recorded from Stripe's `charge.dispute.created`,
+// `.updated` and `.closed` webhook events. It holds the dispute as the
+// newest of those events showed it, whatever order they arrived in.
+// Velox records and reports a dispute, and nothing else: the invoice
+// stays paid and no money moves.
+type InvoiceDispute struct {
+	// AmountCents The disputed amount. It can differ from the payment.
+	AmountCents int64 `json:"amount_cents"`
+
+	// ClosedAt When Stripe closed it. Absent while it is open.
+	ClosedAt  time.Time `json:"closed_at,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	Currency  string    `json:"currency"`
+
+	// EvidenceDueBy The deadline to respond in Stripe. Absent when Stripe gave none.
+	EvidenceDueBy time.Time `json:"evidence_due_by,omitempty"`
+	Id            string    `json:"id"`
+	InvoiceId     string    `json:"invoice_id"`
+	Livemode      bool      `json:"livemode"`
+
+	// OpenedAt When Stripe opened the dispute.
+	OpenedAt time.Time `json:"opened_at"`
+
+	// Reason The reason the cardholder gave, for example `fraudulent`.
+	Reason string `json:"reason,omitempty"`
+
+	// Status Stripe's dispute status, as Stripe sends it. The `warning_`
+	// statuses are an inquiry, which comes before a chargeback or
+	// instead of one. `won`, `lost`, `warning_closed` and `prevented`
+	// are closed.
+	Status          InvoiceDisputeStatus `json:"status"`
+	StripeChargeId  string               `json:"stripe_charge_id,omitempty"`
+	StripeDisputeId string               `json:"stripe_dispute_id"`
+
+	// StripePaymentIntentId The disputed payment.
+	StripePaymentIntentId string    `json:"stripe_payment_intent_id"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+// InvoiceDisputeStatus Stripe's dispute status, as Stripe sends it. The `warning_`
+// statuses are an inquiry, which comes before a chargeback or
+// instead of one. `won`, `lost`, `warning_closed` and `prevented`
+// are closed.
+type InvoiceDisputeStatus string
+
+// InvoiceDisputeList defines model for InvoiceDisputeList.
+type InvoiceDisputeList struct {
+	Data []InvoiceDispute `json:"data"`
+}
+
 // InvoiceLineItem A single line on an invoice.
 type InvoiceLineItem struct {
 	AmountCents        int64     `json:"amount_cents"`
@@ -4489,7 +4946,10 @@ type InvoiceLineItem struct {
 	// TaxReason Stripe-canonical structured `taxability_reason`
 	// (`standard_rated`, `reverse_charge`, `not_collecting`,
 	// `customer_exempt`, `product_exempt`, `zero_rated`, etc.).
-	// Empty for non-Stripe providers.
+	// `prepaid_credit_purchase` is Velox's own value, on a prepaid
+	// commit purchase line under the manual or Stripe Tax provider:
+	// the line is not taxed, and the usage the credit pays for is
+	// taxed when invoiced. Otherwise empty for non-Stripe providers.
 	TaxReason string `json:"tax_reason,omitempty"`
 
 	// TenantId Owning tenant. Omitted when empty.
@@ -4527,8 +4987,13 @@ type InvoiceLineType string
 
 // InvoicePaymentStatus Payment-attempt status. `unknown` marks a Stripe charge attempt that
 // returned an ambiguous error (5xx, timeout, connection reset) where
-// we cannot tell whether Stripe processed the charge — a reconciler
-// resolves these by querying Stripe after a cool-off window.
+// we cannot tell whether Stripe processed the charge. With a payment
+// intent recorded, Velox asks Stripe for it after a short wait. With
+// none (a parked invoice), Velox lists the customer's payments at
+// Stripe every billing tick: it records a payment for the invoice that
+// appears, and if none has appeared 24 hours after the attempt the
+// invoice goes back to `pending` (`failed` after a dunning retry) and
+// is charged again as usual.
 type InvoicePaymentStatus string
 
 // InvoicePaymentTimeline defines model for InvoicePaymentTimeline.
@@ -4614,10 +5079,14 @@ type InvoiceTimelineEvent struct {
 	AmountCents  int64  `json:"amount_cents,omitempty"`
 	AttemptCount int    `json:"attempt_count,omitempty"`
 	Currency     string `json:"currency,omitempty"`
-	Description  string `json:"description"`
 
-	// Detail Extra line shown under the description, for example the card used.
-	Detail    string `json:"detail,omitempty"`
+	// Description The line's title.
+	Description string `json:"description"`
+
+	// Detail The line's meta line as text, its actor last, for example "Visa •••• 4242 · After 2 retries".
+	Detail string `json:"detail,omitempty"`
+
+	// Error The line's problem.
 	Error     string `json:"error,omitempty"`
 	EventType string `json:"event_type"`
 
@@ -4625,20 +5094,31 @@ type InvoiceTimelineEvent struct {
 	Id string `json:"id"`
 
 	// IsSimulated True when `timestamp` is test-clock time.
-	IsSimulated     bool   `json:"is_simulated,omitempty"`
-	PaymentIntentId string `json:"payment_intent_id,omitempty"`
+	IsSimulated bool `json:"is_simulated,omitempty"`
+
+	// Line One activity row in the words of the activity line standard
+	// (ADR-128): a title with no values, the amount when the event moves
+	// money, asks for it or cancels money owed, a problem line on failure
+	// and warning rows, the meta line's parts and the actor, a tone, and
+	// the event's time on the entity's calendar. `recorded_at` is the
+	// real-world time, set only for an entity on a test clock.
+	Line            ActivityLine `json:"line"`
+	PaymentIntentId string       `json:"payment_intent_id,omitempty"`
 
 	// RecordedAt Real-world time of a row whose `timestamp` is test-clock time.
 	RecordedAt time.Time                  `json:"recorded_at,omitempty"`
 	Source     InvoiceTimelineEventSource `json:"source"`
 
-	// Status Display status, for example succeeded, failed, resolved, escalated or info.
-	Status    string    `json:"status"`
-	Timestamp time.Time `json:"timestamp"`
+	// Status The line's tone in older words, read by the dashboard's dot.
+	Status    InvoiceTimelineEventStatus `json:"status"`
+	Timestamp time.Time                  `json:"timestamp"`
 }
 
 // InvoiceTimelineEventSource defines model for InvoiceTimelineEvent.Source.
 type InvoiceTimelineEventSource string
+
+// InvoiceTimelineEventStatus The line's tone in older words, read by the dashboard's dot.
+type InvoiceTimelineEventStatus string
 
 // InvoiceWithLineItems Response shape for `GET /v1/invoices/{id}`. The handler returns the
 // invoice and its line items as separate top-level keys (rather than
@@ -5201,8 +5681,9 @@ type RecipeWebhook struct {
 // refusing to record it would only make the books wrong too.
 //
 // A written-off invoice is settled by RECORDING writers only — an
-// offline payment, or the provider-search reconciler adopting a charge
-// that turns out to have succeeded (ADR-108). Nothing initiates a card
+// offline payment, or Velox recording a card charge that Stripe shows
+// succeeded (its webhook, or the check of an unresolved charge).
+// Nothing initiates a card
 // charge against one (ADR-113): recovery of a returned customer runs on
 // normal rails via a fresh recovery invoice.
 //
@@ -5237,7 +5718,16 @@ type SentEmail struct {
 	Id            string                 `json:"id"`
 	InvoiceNumber string                 `json:"invoice_number,omitempty"`
 	LastError     string                 `json:"last_error,omitempty"`
-	Recipient     string                 `json:"recipient"`
+
+	// Line The email in the words of the activity line standard (ADR-128),
+	// the same as on the invoice's payment timeline: its name and
+	// what happened to it ("Receipt email delivered"), why it was not
+	// sent, the invoice it was about, and who it went to. Dated at the
+	// time on the customer's test clock that caused it, with the real
+	// send time as `recorded_at`. Present for every email type this
+	// list returns.
+	Line      ActivityLine `json:"line,omitempty"`
+	Recipient string       `json:"recipient"`
 
 	// Status Velox's send state. `dispatched` means the mail server accepted it.
 	Status SentEmailStatus `json:"status"`
@@ -5464,14 +5954,19 @@ type SubscriptionTimelineEvent struct {
 	ActorName string `json:"actor_name,omitempty"`
 	ActorType string `json:"actor_type,omitempty"`
 
-	// Description One-line summary, e.g. "Subscription canceled".
+	// Description The line's title, for example "Subscription canceled".
 	Description string `json:"description"`
 
-	// Detail Optional second line with context.
+	// Detail The line's meta line as text, without the actor (see
+	// `actor_name`) and without a date at its end, which is in
+	// `detail_timestamp`. For example "Starter → Pro".
 	Detail string `json:"detail,omitempty"`
 
-	// DetailTimestamp The instant `detail` refers to, for the client to format.
+	// DetailTimestamp The date the end of `detail` refers to, for the client to format, as in "Trial now ends" followed by this date.
 	DetailTimestamp time.Time `json:"detail_timestamp,omitempty"`
+
+	// Error The line's problem.
+	Error string `json:"error,omitempty"`
 
 	// EventType The audit action, e.g. `create`, `cancel`, `subscription.item_updated`.
 	EventType string `json:"event_type"`
@@ -5479,13 +5974,21 @@ type SubscriptionTimelineEvent struct {
 	// IsSimulated True when the action affected a subscription on a test clock.
 	IsSimulated bool `json:"is_simulated,omitempty"`
 
+	// Line One activity row in the words of the activity line standard
+	// (ADR-128): a title with no values, the amount when the event moves
+	// money, asks for it or cancels money owed, a problem line on failure
+	// and warning rows, the meta line's parts and the actor, a tone, and
+	// the event's time on the entity's calendar. `recorded_at` is the
+	// real-world time, set only for an entity on a test clock.
+	Line ActivityLine `json:"line"`
+
 	// SimEffectiveAt The test clock's simulated time when the action took effect.
 	SimEffectiveAt time.Time                       `json:"sim_effective_at,omitempty"`
 	Source         SubscriptionTimelineEventSource `json:"source"`
 
-	// Status Display tone for the row: `info`, `succeeded`, `success` (scheduled plan change applied), `warning` or `canceled`.
-	Status      string `json:"status"`
-	TestClockId string `json:"test_clock_id,omitempty"`
+	// Status The line's tone in older words, read by the dashboard's dot.
+	Status      SubscriptionTimelineEventStatus `json:"status"`
+	TestClockId string                          `json:"test_clock_id,omitempty"`
 
 	// Timestamp When the action was recorded (wall-clock time).
 	Timestamp time.Time `json:"timestamp"`
@@ -5493,6 +5996,9 @@ type SubscriptionTimelineEvent struct {
 
 // SubscriptionTimelineEventSource defines model for SubscriptionTimelineEvent.Source.
 type SubscriptionTimelineEventSource string
+
+// SubscriptionTimelineEventStatus The line's tone in older words, read by the dashboard's dot.
+type SubscriptionTimelineEventStatus string
 
 // Tenant defines model for Tenant.
 type Tenant struct {
@@ -5837,7 +6343,7 @@ type WebhookDelivery struct {
 	TenantId          string                `json:"tenant_id,omitempty"`
 	WebhookEndpointId string                `json:"webhook_endpoint_id"`
 
-	// WebhookEventId The event this delivery sent. A replay's own id for a replay's delivery.
+	// WebhookEventId The event this delivery belongs to. For a replay's delivery, the replay's own id; the message it sent carries the original event's `id`.
 	WebhookEventId string `json:"webhook_event_id"`
 }
 
@@ -5930,11 +6436,15 @@ type WebhookEndpointStats struct {
 
 // WebhookEvent One outbound webhook event, as Velox created it.
 type WebhookEvent struct {
-	CreatedAt time.Time              `json:"created_at"`
-	EventType string                 `json:"event_type"`
-	Id        string                 `json:"id"`
-	Livemode  bool                   `json:"livemode"`
-	Payload   map[string]interface{} `json:"payload"`
+	CreatedAt time.Time `json:"created_at"`
+	EventType string    `json:"event_type"`
+	Id        string    `json:"id"`
+	Livemode  bool      `json:"livemode"`
+
+	// Payload The event's data. docs/webhooks.md lists what each event carries;
+	// `payment.dispute_opened` and `payment.dispute_closed` carry a
+	// `DisputeWebhookEventData`.
+	Payload map[string]interface{} `json:"payload"`
 
 	// ReplayOfEventId Set on a replay. The event the replay was made from.
 	ReplayOfEventId string `json:"replay_of_event_id,omitempty"`
@@ -5952,7 +6462,7 @@ type WebhookEventDeliveryAttempt struct {
 	EndpointUrl         string    `json:"endpoint_url"`
 	Error               string    `json:"error"`
 
-	// EventId The event this delivery sent. A replay's own id when `is_replay` is true.
+	// EventId The event this delivery belongs to. When `is_replay` is true, the replay's own id; the message it sent carries the original event's `id` (`root_event_id`).
 	EventId     string    `json:"event_id"`
 	Id          string    `json:"id"`
 	IsReplay    bool      `json:"is_replay"`
@@ -6235,8 +6745,9 @@ type ListCreditNotesParams struct {
 	Status     ListCreditNotesParamsStatus `form:"status,omitempty" json:"status,omitempty"`
 
 	// RefundStatus `needs_attention` returns issued, non-test-clock notes whose
-	// refund failed, has been pending more than 72 hours, or has a
-	// refund amount still at `none` after 1 hour.
+	// refund failed or has an unknown result, has been pending more
+	// than 72 hours, or has a refund amount still at `none` after 1
+	// hour.
 	RefundStatus ListCreditNotesParamsRefundStatus `form:"refund_status,omitempty" json:"refund_status,omitempty"`
 
 	// Sort One of credit_note_number, total_cents (alias amount), status, issued_at, created_at (default).
@@ -8682,6 +9193,9 @@ type ServerInterface interface {
 	// Charge a finalized invoice now
 	// (POST /v1/invoices/{id}/collect)
 	CollectInvoicePayment(w http.ResponseWriter, r *http.Request, id string, params CollectInvoicePaymentParams)
+	// List the card disputes on an invoice
+	// (GET /v1/invoices/{id}/disputes)
+	ListInvoiceDisputes(w http.ResponseWriter, r *http.Request, id string)
 	// Finalize draft invoice
 	// (POST /v1/invoices/{id}/finalize)
 	PostV1InvoicesIdFinalize(w http.ResponseWriter, r *http.Request, id string, params PostV1InvoicesIdFinalizeParams)
@@ -9504,6 +10018,12 @@ func (_ Unimplemented) GetInvoice(w http.ResponseWriter, r *http.Request, id str
 // Charge a finalized invoice now
 // (POST /v1/invoices/{id}/collect)
 func (_ Unimplemented) CollectInvoicePayment(w http.ResponseWriter, r *http.Request, id string, params CollectInvoicePaymentParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// List the card disputes on an invoice
+// (GET /v1/invoices/{id}/disputes)
+func (_ Unimplemented) ListInvoiceDisputes(w http.ResponseWriter, r *http.Request, id string) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -14058,6 +14578,38 @@ func (siw *ServerInterfaceWrapper) CollectInvoicePayment(w http.ResponseWriter, 
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.CollectInvoicePayment(w, r, id, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListInvoiceDisputes operation middleware
+func (siw *ServerInterfaceWrapper) ListInvoiceDisputes(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListInvoiceDisputes(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -19251,6 +19803,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/v1/invoices/{id}/collect", wrapper.CollectInvoicePayment)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/v1/invoices/{id}/disputes", wrapper.ListInvoiceDisputes)
 	})
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/v1/invoices/{id}/finalize", wrapper.PostV1InvoicesIdFinalize)

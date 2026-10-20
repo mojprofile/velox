@@ -163,7 +163,7 @@ A migration is a versioned script that changes the database schema. Velox applie
 ## Upgrading
 
 1. Read the upgrade notes in the [changelog](../CHANGELOG.md) for every version between yours and the new one.
-2. Take a backup. See [backups](ops/backup-considerations.md).
+2. Take a backup. If the upgrade goes wrong, it is how you go back, and a restore loses everything written after it ([Going back](production-one-vm.md#going-back)). See [backups](ops/backup-considerations.md).
 3. See the plan: run the new version's `velox migrate status`.
 
    **You see:** `state:` with the migrations it will apply, and `running now:  no`. A `refused` state names its next step; follow it before you go on.
@@ -172,7 +172,7 @@ A migration is a versioned script that changes the database schema. Velox applie
 
    **You see:** `/health/ready` answers 200 again.
 
-On one VM there is one copy, so Velox is down while the new version starts. For the Compose commands, see [Day-to-day commands](../deploy/compose/README.md#day-to-day-commands). With two or more copies, see [Upgrades](ops/high-availability.md#upgrades).
+On one VM there is one copy, so Velox is down while the new version starts. For the Compose commands, see [Upgrade to a new release](production-one-vm.md#upgrade-to-a-new-release), or [Upgrade](../deploy/compose/README.md#upgrade) for a stack built from source. With two or more copies, see [Upgrades](ops/high-availability.md#upgrades).
 
 ## Settings
 
@@ -186,7 +186,7 @@ Velox reads its settings from environment variables. The tables below list the m
 | `APP_DATABASE_URL` | Postgres connection URL for the limited user. Required in `staging` and `production`. |
 | `VELOX_ENCRYPTION_KEY` | Encrypts stored personal data. 64 hex characters. Required in `production`. |
 | `REDIS_URL` | Redis, for rate limiting. Required in `production`. If Redis goes down later, sign-in stays rate-limited, but each copy counts on its own. |
-| `TRUST_PROXY` | The addresses of your proxy or load balancer, comma-separated. Velox then trusts the client address they forward. Use `none` if there is no proxy. Required in `production`. Velox refuses to start if an entry is not an IP address or CIDR. |
+| `TRUST_PROXY` | The addresses of your proxy or load balancer, comma-separated. Velox then trusts the client address they forward in `X-Forwarded-For`; it does not read `X-Real-IP`. Use `none` if there is no proxy. Required in `production`. Velox refuses to start if an entry is not an IP address or CIDR. |
 
 Why `TRUST_PROXY` is required: without it, every request behind a load balancer appears to come from the load balancer, so all users would share one rate limit. The audit log and dashboard sign-in records would also show the load balancer's address. And the sign-in throttle would treat everyone as one address: 5 wrong passwords for an email, from anyone, would make every new browser wait to sign in with it.
 
@@ -221,7 +221,7 @@ To check it, sign in, switch the dashboard to test mode and open the audit log. 
 
 Stripe is not set here. Each tenant connects its own Stripe account in the dashboard, under Settings → Payments. The Stripe API keys and the webhook signing secret (`whsec_…`) are stored per tenant, in the database.
 
-**`INVOICE_GRACE_PERIOD` delays every period-end invoice**, not only invoices with usage. A subscription's period-end invoice, and the final invoice of a cancel scheduled for a date, is built on the first billing run after the period end plus the grace. The billing run is hourly, so with the default the invoice is built 1 to 2 hours after the period ends. Everything that follows the invoice moves with it: the `invoice.finalized` webhook, the tax record, credits applied, the charge, and the first payment-failure retry. The invoice's dates and amounts do not move: it is issued and dated at the period end. A cancel or a plan change scheduled for a date also takes effect at that close, up to the grace after its date: until then the subscription is still `active` on its old plan, and `subscription.canceled` is sent then. Its dates do not move: `canceled_at` is the scheduled date. A scheduled resume of paused collection that falls after a period end waits for that period's close too. A credit grant is retired up to the grace after its `expires_at`, and the balance shows it until then.
+**`INVOICE_GRACE_PERIOD` delays every period-end invoice**, not only invoices with usage. A subscription's period-end invoice, and the final invoice of a cancel scheduled for a date, is built on the first billing run after the period end plus the grace. The billing run is hourly, so with the default the invoice is built 1 to 2 hours after the period ends. Everything that follows the invoice moves with it: the `invoice.finalized` webhook, the tax record, credits applied, the charge, and the first payment-failure retry. The invoice's dates and amounts do not move: it is issued and dated at the period end. A cancel or a plan change scheduled for a date also takes effect at that close, up to the grace after its date: until then the subscription is still `active` on its old plan, and `subscription.canceled` is sent then. Its dates do not move: `canceled_at` is the scheduled date. A scheduled resume of paused collection that falls after a period end waits for that period's close too. A credit grant that expires after a period ends stays in the balance until that period's invoice has been built and collected. That invoice still draws on it.
 
 Raise it if your usage pipeline can deliver an event more than an hour late. Usage stamped inside a period that arrives after its invoice is built is stored but not billed (see [late events](api-surface.md)). Other billing products use 1 hour (Stripe), 12 hours (Orb) and 24 hours (Metronome).
 

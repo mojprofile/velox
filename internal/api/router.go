@@ -152,8 +152,9 @@ func WithRateLimits(rl config.RateLimits) ServerOption {
 }
 
 // WithInvoiceGrace sets INVOICE_GRACE_PERIOD (ADR-120). One value feeds the
-// three places that must agree on when a period is due: the billing runs'
-// due scans, the billing backlog gauges, and the credit-expiry sweep.
+// two places that must agree on when a period is due: the billing runs' due
+// scans and the billing backlog gauges. The credit-expiry sweep does not use
+// it: it holds a grant until the close that draws on it has run (ADR-071 §2).
 func WithInvoiceGrace(d time.Duration) ServerOption {
 	return func(o *serverOptions) { o.invoiceGrace = d }
 }
@@ -290,7 +291,6 @@ func NewServer(db *postgres.DB, clk clock.Clock, rdb *redis.Client, opts ...Serv
 	creditStore := credit.NewPostgresStore(db)
 	creditSvc := credit.NewService(creditStore)
 	creditSvc.SetCustomerReader(customerStore)
-	creditSvc.SetExpiryGrace(o.invoiceGrace)
 	creditH := credit.NewHandler(creditSvc)
 	creditNoteStore := creditnote.NewPostgresStore(db)
 	// The credit-note issue stamp copies customer PII, so it needs the
@@ -462,10 +462,19 @@ func NewServer(db *postgres.DB, clk clock.Clock, rdb *redis.Client, opts ...Serv
 	// Reconcile async refund outcomes (pending→succeeded/failed) from refund
 	// webhooks onto the credit note — the create-call only sees the initial state.
 	stripeAdapter.SetRefundStatusUpdater(creditNoteSvc)
+	// Record card disputes (charge.dispute.*) against the disputed invoice,
+	// with payment.dispute_opened / .closed queued in the same tx (#979).
+	stripeAdapter.SetDisputeRecorder(invoiceStore)
 	// Resolve an active dunning run promptly when a card payment settles (the
 	// background-settle paths already resolve via the engine; this closes the
 	// card-success symmetry — #317 follow-up). dunningSvc implements ResolveByInvoice.
 	stripeAdapter.SetDunningResolver(dunningSvc)
+	// A charge Stripe refuses for the key (401/403) shows on the Settings →
+	// Payments card, as a failed Connect check does.
+	stripeAdapter.SetKeyHealth(tenantStripeSvc)
+	// A credit note that leaves a dunned invoice with nothing due marks it
+	// paid; this closes its dunning run too, escalated runs included.
+	creditNoteSvc.SetDunningResolver(dunningSvc)
 
 	// Wire payment retrier now that stripeAdapter exists
 	dunningSvc.SetRetrier(&paymentRetrierAdapter{
@@ -495,6 +504,10 @@ func NewServer(db *postgres.DB, clk clock.Clock, rdb *redis.Client, opts ...Serv
 	// invoice service which is defined just above; other dunning
 	// adapters (pauser, canceler) wire earlier next to dunningSvc.
 	dunningSvc.SetInvoiceUncollectibleMarker(&invoiceUncollectibleAdapter{svc: invoiceSvc})
+	// Dunning's final action takes the invoice's charge hold (ADR-127), so no
+	// charge starts while it cancels or pauses the subscription, and it does
+	// not run while a lost charge waits for the stale-hold sweep.
+	dunningSvc.SetChargeHoldClaimer(invoiceStore)
 	// Route the dunning manual-resolve void through the invoice service (single
 	// void writer: guards + in-flight block + tax reversal + invoice.voided
 	// event) instead of the raw store. Same lazy wire as the marker above.
@@ -715,7 +728,15 @@ func NewServer(db *postgres.DB, clk clock.Clock, rdb *redis.Client, opts ...Serv
 	invoiceH.SetAuditLogger(auditLogger)
 	// ADR-104: timeline lifecycle rows join their wall-clock audit stamps.
 	invoiceH.SetAuditStamps(&invoiceAuditStampsAdapter{logger: auditLogger})
+	// ADR-128: invoice activity rows link the invoice's subscription by name.
+	invoiceH.SetSubscriptionLabeler(&invoiceSubscriptionLabelAdapter{store: subStore})
+	// ADR-128: the Dunning page's recovery timeline carries the lines the
+	// invoice's Activity card shows for the same events, built by the
+	// invoice handler from the same sources.
+	dunningH.SetEventLiner(invoiceH)
 	subH.SetAuditLogger(auditLogger)
+	// ADR-128: subscription activity rows link the invoices they name.
+	subH.SetInvoiceLabeler(&subscriptionInvoiceLabelAdapter{store: invoiceStore})
 	creditNoteH.SetAuditLogger(auditLogger)
 	// CN document email (ADR-082 rider) rides the transactional outbox
 	// like every other customer email.
@@ -905,6 +926,10 @@ func NewServer(db *postgres.DB, clk clock.Clock, rdb *redis.Client, opts ...Serv
 	// invoices — pre-fix the handler hardcoded Net 30, so a Net-15 tenant's
 	// proration invoice carried a different due date than its siblings.
 	subH.SetNetTermsReader(engine)
+	// A proration invoice born finalized writes the engine's finalize audit
+	// row and sends its invoice.finalized payload (#1279). audit.MustWired
+	// below refuses to boot without it.
+	subH.SetInvoiceFinalizeRecorder(engine)
 	// Wire the db handle so addItem (and updateItem / removeItem when
 	// they migrate to the same pattern) can open an outer tx wrapping
 	// the sub-item insert + proration writes — atomic guarantee that
@@ -954,6 +979,9 @@ func NewServer(db *postgres.DB, clk clock.Clock, rdb *redis.Client, opts ...Serv
 	// A card the bank refused for good (#966) turns the decline notice into
 	// "needs a different card", by the same rule the dunning retry skips it.
 	invoiceSvc.SetCardRefusalReader(invoiceStore)
+	// Card disputes (#979): the dispute_lost notice, the timeline's dispute
+	// rows and GET /v1/invoices/{id}/disputes.
+	invoiceSvc.SetDisputeReader(invoiceStore)
 	invoiceSvc.SetCreditApplier(creditSvc)
 	// Tenant net-terms fallback: a manual invoice created without an explicit
 	// net_payment_term_days inherits the tenant's configured default (then 30),
@@ -1438,29 +1466,7 @@ func NewServer(db *postgres.DB, clk clock.Clock, rdb *redis.Client, opts ...Serv
 	paymentMethodsH.SetCooldown(setupLinkCooldown)
 
 	r := chi.NewRouter()
-	r.Use(mw.Tracing())
-	// NOT chi's middleware.RequestID — it honours an inbound X-Request-Id header
-	// verbatim, which would let a caller choose the request_id recorded on their
-	// own audit_log rows. mw.RequestID always mints server-side. See its doc
-	// comment and ADR-090 §7 (read egress).
-	r.Use(mw.RequestID)
-	// Only honor X-Forwarded-For / X-Real-IP from configured trusted proxies.
-	// chi's middleware.RealIP trusted them unconditionally, letting any client
-	// forge a forwarding header to rotate its per-IP rate-limit bucket
-	// (enumeration bypass) or pin a victim's IP. TRUST_PROXY is a comma-list of
-	// CIDRs / IPs (e.g. "10.0.0.0/8,127.0.0.1"); unset → trust nothing and key
-	// rate limits on the raw TCP peer.
-	trustProxy := os.Getenv("TRUST_PROXY")
-	trustedProxies := mw.ParseTrustedProxies(trustProxy)
-	switch {
-	case strings.EqualFold(strings.TrimSpace(trustProxy), "none"):
-		slog.Info("TRUST_PROXY=none — no proxy in front; rate limiting keys on the direct TCP peer")
-	case len(trustedProxies) == 0:
-		// Production refuses to boot in this state (config.validateFatal);
-		// local/staging get the warning.
-		slog.Warn("TRUST_PROXY not set — X-Forwarded-For/X-Real-IP ignored; rate limiting keys on the direct TCP peer. Behind a balancer that is ONE bucket for everyone: set TRUST_PROXY to the balancer's CIDR, or TRUST_PROXY=none if there is no proxy.")
-	}
-	r.Use(mw.TrustedRealIP(trustedProxies))
+	useRequestEdge(r, os.Getenv("TRUST_PROXY"))
 	corsEnv := os.Getenv("CORS_ALLOWED_ORIGINS")
 	if corsEnv == "" {
 		corsEnv = "http://localhost:3000,http://localhost:5173,http://localhost:5174"
@@ -1496,7 +1502,7 @@ func NewServer(db *postgres.DB, clk clock.Clock, rdb *redis.Client, opts ...Serv
 	// Mounted at the ROOT, not on /v1: the catch-all it replaces only ever saw
 	// the /v1 block, so /v1/auth, /v1/tenants, /v1/public/*, /v1/webhooks and
 	// /v1/bootstrap were invisible to it (ADR-090 RC1). It also sits AFTER
-	// RequestID + TrustedRealIP so the ctx it seeds for every downstream audit
+	// RequestID + TrustedClientIP so the ctx it seeds for every downstream audit
 	// emission carries the request id and the real client IP.
 	r.Use(mw.AuditCoverage(auditRouteExempt))
 
@@ -1979,15 +1985,45 @@ func requestLogger(next http.Handler) http.Handler {
 	})
 }
 
+// useRequestEdge mounts the first middlewares every request passes: the
+// trace span, the server-minted request id, the trusted client IP and the
+// span correction. Everything after it can answer without routing (CORS
+// preflight), so the span correction must sit here.
+func useRequestEdge(r chi.Router, trustProxy string) {
+	r.Use(mw.Tracing())
+	// NOT chi's middleware.RequestID — it honours an inbound X-Request-Id header
+	// verbatim, which would let a caller choose the request_id recorded on their
+	// own audit_log rows. mw.RequestID always mints server-side. See its doc
+	// comment and ADR-090 §7 (read egress).
+	r.Use(mw.RequestID)
+	// The client IP comes from chi's ClientIPFrom* middleware: X-Forwarded-For
+	// is read only when the TCP peer is inside TRUST_PROXY (a comma-list of
+	// CIDRs / IPs, e.g. "10.0.0.0/8,127.0.0.1"); otherwise, and when
+	// TRUST_PROXY is unset or "none", it is the TCP peer. Rate limits, audit
+	// and session rows, logs and spans all read it via audit.ExtractClientIP.
+	trustedProxies := mw.ParseTrustedProxies(trustProxy)
+	switch {
+	case strings.EqualFold(strings.TrimSpace(trustProxy), "none"):
+		slog.Info("TRUST_PROXY=none — no proxy in front; rate limiting keys on the direct TCP peer")
+	case len(trustedProxies) == 0:
+		// Production refuses to boot in this state (config.validateFatal);
+		// local/staging get the warning.
+		slog.Warn("TRUST_PROXY not set — X-Forwarded-For ignored; rate limiting keys on the direct TCP peer. Behind a balancer that is ONE bucket for everyone: set TRUST_PROXY to the balancer's CIDR, or TRUST_PROXY=none if there is no proxy.")
+	}
+	r.Use(mw.TrustedClientIP(trustedProxies))
+	r.Use(mw.TraceRequestAttrs(loggablePath))
+}
+
 // loggablePath returns the request path with capability tokens removed.
-// The public surfaces carry bearer-equivalent secrets IN the path
-// (/v1/public/invoices/{256-bit token}, /v1/public/payment-updates/
-// {single-use token}) — logging the raw path writes live payment
-// credentials into every log sink. Prefer chi's matched route pattern
-// ("/v1/public/invoices/{token}"); when no pattern matched (404s),
-// redact the segment after any known public token prefix instead —
-// unmatched probes against those prefixes still contain candidate
-// secrets.
+// Four routes carry a bearer-equivalent secret IN the path: hosted
+// invoices, payment updates, the public cost dashboard and the team
+// invite preview — logging the raw path writes live credentials into
+// every log sink. Prefer chi's matched route pattern
+// ("/v1/public/invoices/{token}"); when no pattern matched (a 404, or a
+// CORS preflight answered before routing), redact the segment after any
+// known token prefix instead. Unmatched requests on those prefixes
+// still contain candidate secrets. A new {token} route adds its prefix
+// here.
 func loggablePath(r *http.Request) string {
 	if rctx := chi.RouteContext(r.Context()); rctx != nil {
 		if pat := rctx.RoutePattern(); pat != "" {
@@ -1995,7 +2031,12 @@ func loggablePath(r *http.Request) string {
 		}
 	}
 	path := r.URL.Path
-	for _, prefix := range []string{"/v1/public/invoices/", "/v1/public/payment-updates/"} {
+	for _, prefix := range []string{
+		"/v1/public/invoices/",
+		"/v1/public/payment-updates/",
+		"/v1/public/cost-dashboard/",
+		"/v1/auth/invite/",
+	} {
 		if rest, ok := strings.CutPrefix(path, prefix); ok && rest != "" {
 			// Keep any sub-path (e.g. /pdf, /checkout) after the token.
 			if i := strings.IndexByte(rest, '/'); i >= 0 {

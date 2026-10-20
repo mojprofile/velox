@@ -94,7 +94,8 @@ func humanizeDeclineCode(code string) string {
 
 // ErrPaymentTransient signals that this charge request charged nothing, so
 // the invoice state is unchanged: the circuit breaker was open, the
-// credentials could not be read, or Stripe refused the request with 429. The
+// credentials could not be read, Stripe refused the request with 429, or
+// Stripe refused the key (StripeKeyError). The
 // scheduler/dunning path should treat this as "skip this tick" and not tick
 // the dunning attempt count, unlike a real payment failure.
 //
@@ -104,6 +105,57 @@ func humanizeDeclineCode(code string) string {
 // the same initiator resends the same key; another charge kind or a changed
 // card sends a new one.
 var ErrPaymentTransient = errors.New("payment attempt skipped; upstream breaker open, timeout before Stripe, or Stripe rate limit")
+
+// ErrStripeCredentialsUnavailable is the ErrPaymentTransient for a request
+// that never left: the tenant's Stripe credentials could not be read (a
+// database blip). Unlike a 429 it says nothing could be running at Stripe, so
+// the charge releases its hold (ADR-127).
+var ErrStripeCredentialsUnavailable = fmt.Errorf("%w: stripe credentials could not be read", ErrPaymentTransient)
+
+// StripeKeyError is a charge that never ran because Stripe refused the
+// tenant's API key (401: the key is invalid or was rolled; 403: a restricted
+// key without permission to create PaymentIntents) or because no key is
+// connected for this mode. The key is wrong, not the card, so it is not a
+// decline: no dunning attempt is used, the invoice is not marked failed, and
+// no customer email carries Stripe's sentence. The operator is told instead
+// (a metric, an ERROR line, and the Settings → Payments notice).
+//
+// It wraps ErrPaymentTransient so every charge caller skips the tick
+// unchanged. It must not be or wrap a *PaymentError: the auto-charge sweep,
+// the dunning retry and Collect all check errors.As(*PaymentError) with
+// Unknown=false before ErrPaymentTransient, and would count it as a decline.
+// So ErrStripeNotConfigured, itself a PaymentError that refunds, the
+// checkout sync and the stale-hold sweep read, is not wrapped either.
+type StripeKeyError struct {
+	Reason  string // StripeKeyRejected or StripeKeyNotConfigured
+	Message string // Stripe's own sentence, scrubbed; empty for not_configured
+}
+
+// Reasons of a StripeKeyError; also the label of
+// velox_stripe_key_unusable_total.
+const (
+	StripeKeyRejected      = "rejected"
+	StripeKeyNotConfigured = "not_configured"
+)
+
+func (e *StripeKeyError) Error() string {
+	if e.Reason == StripeKeyNotConfigured {
+		return "payment attempt skipped: stripe not configured for this mode"
+	}
+	return "payment attempt skipped: stripe rejected the API key: " + e.Message
+}
+
+func (e *StripeKeyError) Unwrap() error { return ErrPaymentTransient }
+
+// OperatorSafeMessage implements respond.SafeMessageError. Stripe's own
+// sentence names the key's last characters or the missing permission; it
+// goes to the log and the Settings notice, not to this response.
+func (e *StripeKeyError) OperatorSafeMessage() string {
+	return "Stripe refused this account's API key (or none is connected for this mode). Nothing was charged. Update the key under Settings → Payments, then collect again."
+}
+
+// OperatorErrorCode names the fault so a caller can tell it from a decline.
+func (e *StripeKeyError) OperatorErrorCode() string { return "stripe_key_unusable" }
 
 // isRateLimited reports whether Stripe refused the request with HTTP 429. A
 // real test-mode reply (2026-10-14) is status 429, type "rate_limit_error",
@@ -225,6 +277,23 @@ func classifyStripeError(err error) *PaymentError {
 // actionable signal ("connect Stripe under Settings → Payments").
 var ErrStripeNotConfigured = &PaymentError{Message: "stripe not configured for this mode"}
 
+// ErrStripeAuthFailed marks a read Stripe refused with 401 or 403: the
+// tenant's key is wrong or revoked, or is a restricted key without permission
+// to read PaymentIntents. It will not succeed until someone fixes the key, so
+// the stale-hold sweep logs it as a check that cannot run (ADR-127).
+var ErrStripeAuthFailed = errors.New("stripe rejected the API key")
+
+// ErrStripeUnreachable marks a read that got no answer from Stripe: a
+// network error, or the caller's time limit ended it. Unlike a 5xx or a 429,
+// which Stripe answers at once, it can take as long as the time limit allows,
+// so the stale-hold sweep stops for the tick after several in a row.
+var ErrStripeUnreachable = errors.New("stripe could not be reached")
+
+// ErrStripeCustomerMissing marks a read Stripe refused because the customer
+// does not exist in this account (resource_missing on the customer): deleted,
+// or created under other credentials. It will not succeed on retry.
+var ErrStripeCustomerMissing = errors.New("stripe customer not found in this account")
+
 // ErrNoSavedCard is FetchCardDetails' "the Stripe customer has no card" — a
 // one-off payment where the customer did not save the card. It is the only
 // FetchCardDetails error that means "nothing to record"; any other is a
@@ -249,14 +318,22 @@ func NewLiveStripeClient(clients *StripeClients) *LiveStripeClient {
 }
 
 // client resolves the Stripe client for ctx: ErrStripeNotConfigured when the
-// tenant has no credentials for this mode, ErrPaymentTransient (nothing was
-// sent to Stripe; retry) when the credentials could not be read. A lookup
-// blip used to read as "not configured" — a definite failure that spent a
-// dunning attempt.
+// tenant has no credentials for this mode, ErrStripeCredentialsUnavailable
+// (an ErrPaymentTransient: nothing was sent to Stripe; retry) when the
+// credentials could not be read. A lookup blip used to read as "not
+// configured" — a definite failure that spent a dunning attempt.
 func (c *LiveStripeClient) client(ctx context.Context) (*stripe.Client, error) {
+	// No Stripe mode configured at all: NewLiveStripeClient returned nil, and
+	// router.go still hands it to the reconciler. The stale-hold sweep can
+	// meet a held invoice whose customer has a Stripe id even then (Stripe
+	// removed after charges ran), so answer "not configured" instead of
+	// panicking the tick.
+	if c == nil || c.clients == nil {
+		return nil, ErrStripeNotConfigured
+	}
 	sc, err := c.clients.ResolveCtx(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("%w: stripe credential lookup: %v", ErrPaymentTransient, err)
+		return nil, fmt.Errorf("%w: %v", ErrStripeCredentialsUnavailable, err)
 	}
 	if sc == nil {
 		return nil, ErrStripeNotConfigured
@@ -266,6 +343,9 @@ func (c *LiveStripeClient) client(ctx context.Context) (*stripe.Client, error) {
 
 func (c *LiveStripeClient) CreatePaymentIntent(ctx context.Context, params PaymentIntentParams) (PaymentIntentResult, error) {
 	sc, err := c.client(ctx)
+	if errors.Is(err, ErrStripeNotConfigured) {
+		return PaymentIntentResult{}, &StripeKeyError{Reason: StripeKeyNotConfigured}
+	}
 	if err != nil {
 		return PaymentIntentResult{}, err
 	}
@@ -304,12 +384,22 @@ func (c *LiveStripeClient) CreatePaymentIntent(ctx context.Context, params Payme
 		if isRateLimited(err) {
 			// Stripe refused this request before processing it, so this
 			// request charged nothing (an earlier one that stripe-go resent
-			// may still be running; see isRateLimited). Treat it like the
-			// breaker short-circuit: no state write, the hold stays, and the
-			// next tick tries again. Classified as an error it would park the
-			// invoice at 'unknown' (an unrecognised type) for a person to
-			// resolve.
+			// may still be running; see isRateLimited). A transient skip: no
+			// state write, and the next tick tries again. Unlike the breaker
+			// short-circuit the hold stays, for that earlier request. Classified
+			// as an error it would park the invoice at 'unknown' (an
+			// unrecognised type) for a person to resolve.
 			return PaymentIntentResult{}, fmt.Errorf("%w: stripe rate limit: %v", ErrPaymentTransient, errs.Scrub(err.Error()))
+		}
+		// Stripe refused the key itself, before looking at the charge: 401 for
+		// an invalid or rolled key, 403 for a restricted key without
+		// PaymentIntent write access. Both come as invalid_request_error, so
+		// read by type they were a definite failure: the invoice marked
+		// failed, a dunning attempt used, Stripe's sentence in the customer's
+		// email. Keyed on the HTTP status, which is what says "the key".
+		var se *stripe.Error
+		if errors.As(err, &se) && (se.HTTPStatusCode == http.StatusUnauthorized || se.HTTPStatusCode == http.StatusForbidden) {
+			return PaymentIntentResult{}, &StripeKeyError{Reason: StripeKeyRejected, Message: errs.Scrub(se.Msg)}
 		}
 		return PaymentIntentResult{}, classifyStripeError(err)
 	}
@@ -439,9 +529,16 @@ func paymentIntentResult(pi *stripe.PaymentIntent) PaymentIntentResult {
 		ID:                  pi.ID,
 		Status:              string(pi.Status),
 		ClientSecret:        pi.ClientSecret,
+		CreatedAt:           pi.Created,
 		Purpose:             pi.Metadata["velox_purpose"],
+		InvoiceID:           pi.Metadata["velox_invoice_id"],
 		AmountReceivedCents: pi.AmountReceived,
 		AnchorAt:            anchorFromPIMetadata(pi.Metadata),
+	}
+	// Only an expanded latest_charge says whether it was refunded; an
+	// unexpanded one carries just its id, and Refunded reads false.
+	if pi.LatestCharge != nil && pi.LatestCharge.Refunded {
+		res.FullyRefunded = true
 	}
 	if lpe := pi.LastPaymentError; lpe != nil {
 		res.DeclineCode = declineCodeOf(string(lpe.Type), string(lpe.Code), string(lpe.DeclineCode))
@@ -469,82 +566,64 @@ func anchorFromPIMetadata(meta map[string]string) time.Time {
 	return t
 }
 
-// classifySearchError decides whether a failed PI search is a PERMANENT
-// capability refusal (the caller latches its sweep off for this account+mode)
-// or an ordinary transient failure (the caller stamps the row and retries
-// after the cool-off). Getting this wrong in the permanent direction is the
-// expensive mistake: the latch lives in memory and never re-probes, so the
-// sweep stays off until the process restarts.
+// ListPaymentIntentsForCustomer is the stale-hold sweep's read (ADR-127):
+// every PaymentIntent of the Stripe customer created at or after createdGTE,
+// each with its velox_invoice_id, status, captured amount and whether its
+// latest charge was refunded in full (expand[]=data.latest_charge).
 //
-// invalid_request on a fixed-shape query is "search is not offered here"
-// (Stripe documents Search as unavailable to businesses in India; permission
-// and tier refusals take the same shape). Retrying that never helps.
+// Why List and not Search (Stripe's docs, fetched 2026-10-19): List is the
+// read-after-write API — "Don't use search for read-after-write flows… use the
+// various list APIs… These APIs aren't subject to the availability delays" —
+// and it is offered in every country, while Search "isn't available to
+// businesses in India". The sweep reads "no PaymentIntent for this invoice" as
+// "Stripe never received the charge", which only a consistent read supports.
 //
-// EXCEPT a 401. Stripe answers a bad or revoked secret key with the SAME
-// `invalid_request_error` type ("Invalid API Key provided"), so the type alone
-// cannot separate a capability refusal from a credential fault — and a
-// credential fault heals the moment the operator fixes the key. Treating it as
-// a refusal meant one botched key rotation disabled parked-invoice
-// self-resolution for the whole process, with a single CRITICAL log line as
-// the only signal.
-//
-// Verified against the live API 2026-08-05: bad key → 401, genuine
-// request-shape refusal → 400. Discriminating on the HTTP status uses the
-// semantic that already carries the distinction (Unauthorized vs Bad Request)
-// rather than matching on message text.
-func classifySearchError(err error) error {
-	var se *stripe.Error
-	if errors.As(err, &se) && se.Type == stripe.ErrorTypeInvalidRequest &&
-		se.HTTPStatusCode != http.StatusUnauthorized {
-		return fmt.Errorf("%w: %s", ErrSearchNotOffered, errs.Scrub(se.Msg))
-	}
-	return classifyStripeError(err)
-}
-
-// SearchPaymentIntentsByInvoiceID implements the ADR-108 lookup: find the
-// PaymentIntents this invoice's attempts created, by the velox_invoice_id
-// metadata every engine PI carries since inception (stripe.go chargeInvoice).
-//
-// Two provider properties shape every caller (verified against Stripe docs,
-// 2026-08-02):
-//   - EVENTUAL CONSISTENCY: "data is searchable in under 1 minute…
-//     propagation of new or updated data could be delayed during an outage".
-//     The outage that mints a parked invoice is the same weather that delays
-//     its PI's indexing, so an EMPTY result proves nothing — callers must
-//     never write a money outcome from absence (the attack round that forced
-//     this is recorded in ADR-108).
-//   - Search filters on cached fields but RETURNS current objects, so the
-//     statuses read off these results are authoritative-current.
-//
-// Errors pass through classifyStripeError like every other call here; the
-// caller additionally treats the invalid_request class as "search not offered
-// on this account" (the documented India case and its kin) and disables its
-// sweep for the account rather than retrying a request-shape error forever.
-func (c *LiveStripeClient) SearchPaymentIntentsByInvoiceID(ctx context.Context, invoiceID string) ([]PaymentIntentResult, error) {
+// An error on any page fails the whole read: a partial list is never
+// returned, because a missing page could hold the payment. Errors are typed
+// for the sweep: ErrStripeNotConfigured, ErrStripeAuthFailed (401, 403) and
+// ErrStripeCustomerMissing (resource_missing on the customer) will not
+// succeed on retry; anything else (5xx, 429, network, unreadable
+// credentials) may, and a read Stripe never answered (network, time limit)
+// is also ErrStripeUnreachable.
+func (c *LiveStripeClient) ListPaymentIntentsForCustomer(ctx context.Context, stripeCustomerID string, createdGTE time.Time) ([]PaymentIntentResult, error) {
 	sc, err := c.client(ctx)
 	if err != nil {
 		return nil, err
 	}
-	params := &stripe.PaymentIntentSearchParams{
-		SearchParams: stripe.SearchParams{
-			Query: fmt.Sprintf("metadata['velox_invoice_id']:'%s'", invoiceID),
-		},
+	params := &stripe.PaymentIntentListParams{
+		Customer:     stripe.String(stripeCustomerID),
+		CreatedRange: &stripe.RangeQueryParams{GreaterThanOrEqual: createdGTE.Unix()},
 	}
+	params.Limit = stripe.Int64(100)
+	params.AddExpand("data.latest_charge")
 	var out []PaymentIntentResult
-	for pi, err := range sc.V1PaymentIntents.Search(ctx, params) {
+	for pi, err := range sc.V1PaymentIntents.List(ctx, params) {
 		if err != nil {
-			return nil, classifySearchError(err)
+			return nil, fmt.Errorf("list PaymentIntents of Stripe customer %s: %w", stripeCustomerID, classifyListError(err))
 		}
-		out = append(out, PaymentIntentResult{
-			ID:                  pi.ID,
-			Status:              string(pi.Status),
-			ClientSecret:        pi.ClientSecret,
-			CreatedAt:           pi.Created,
-			Purpose:             pi.Metadata["velox_purpose"],
-			AmountReceivedCents: pi.AmountReceived,
-		})
+		out = append(out, paymentIntentResult(pi))
 	}
 	return out, nil
+}
+
+// classifyListError types a failed PaymentIntent list for the stale-hold
+// sweep: a 401, a 403 (a restricted key without PaymentIntent read access)
+// and a missing customer will not heal on retry; a read Stripe never answered
+// (no *stripe.Error: a network error, a time limit) is ErrStripeUnreachable;
+// everything else is classifyStripeError's. The sweep retries all but the
+// first three.
+func classifyListError(err error) error {
+	var se *stripe.Error
+	if !errors.As(err, &se) {
+		return fmt.Errorf("%w: %w", ErrStripeUnreachable, classifyStripeError(err))
+	}
+	switch {
+	case se.HTTPStatusCode == http.StatusUnauthorized || se.HTTPStatusCode == http.StatusForbidden:
+		return fmt.Errorf("%w: %s", ErrStripeAuthFailed, errs.Scrub(se.Msg))
+	case se.Code == stripe.ErrorCodeResourceMissing && (se.Param == "customer" || strings.Contains(se.Msg, "customer")):
+		return fmt.Errorf("%w: %s", ErrStripeCustomerMissing, errs.Scrub(se.Msg))
+	}
+	return classifyStripeError(err)
 }
 
 // GetCheckoutSession reads a hosted Checkout Session's outcome (the hosted

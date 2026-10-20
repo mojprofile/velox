@@ -1670,7 +1670,8 @@ export interface paths {
          * @description Sends the delivery's event again to this one endpoint only. Other
          *     endpoints are not contacted. Velox copies the event to a new event
          *     (`replay_of` points to the original) and queues a new delivery.
-         *     The original delivery is not changed. Sending happens in the
+         *     The message sent carries the original event's `id` and
+         *     `created_at`. The original delivery is not changed. Sending happens in the
          *     background, so `status` is always `queued`.
          *     Writes an audit row.
          */
@@ -1829,8 +1830,9 @@ export interface paths {
          * Replay an event to all matching endpoints
          * @description Copies the event to a new event and queues it for every active
          *     endpoint in the same mode that subscribes to its type. Endpoints
-         *     that already received it get it again. The original event and its
-         *     deliveries are not changed. Each call makes a new copy.
+         *     that already received it get it again, with the original event's
+         *     `id` and `created_at`. The original event and its deliveries are
+         *     not changed. Each call makes a new copy.
          *
          *     `replay_of` is always the original event, even when `id` is a
          *     replay. `status` is `queued`, or `no_matching_endpoints` when no
@@ -2742,6 +2744,11 @@ export interface paths {
          *     credit note, or reduces the amount due when the period's invoice
          *     is still unpaid. `proration` in the response describes the result.
          *     A plan billed in arrears is settled at the end of the period.
+         *
+         *     Changes to one subscription's items run one at a time, and each is
+         *     settled from the item as the change before it left it. A request
+         *     that repeats a change that already finished finds nothing to change
+         *     and gets 422.
          *
          *     Sends `subscription.item.updated`, or
          *     `subscription.pending_change.scheduled` for a scheduled plan
@@ -3798,8 +3805,10 @@ export interface paths {
          *
          *     Leave out `amount_cents`, or send 0, to refund everything not yet
          *     refunded. The response is the credit note. Check its
-         *     `refund_status`: if Stripe failed, it is `failed` and can be retried
-         *     with `POST /v1/credit-notes/{id}/retry-refund`.
+         *     `refund_status`: if Stripe refused the refund, it is `failed`. If
+         *     Stripe gave no clear answer, it is `unknown`: the customer may
+         *     already be refunded, so don't refund again in the Stripe Dashboard.
+         *     Retry either with `POST /v1/credit-notes/{id}/retry-refund`.
          *
          *     Only invoices paid by card through Stripe can be refunded here. For
          *     an invoice paid outside Stripe, create a credit note with
@@ -3825,13 +3834,45 @@ export interface paths {
          *     lifecycle steps (created, finalized, paid, voided, marked
          *     uncollectible), charge attempts (source `payment`, event_type
          *     `charge_attempt.succeeded|failed|unknown`), dunning retries, credit
-         *     notes and customer emails.
+         *     notes, customer emails, and card disputes (source `dispute`, a
+         *     `payment.dispute_opened` row and, once Stripe closes the dispute, a
+         *     `payment.dispute_closed` row; both at Stripe's own time).
          *     A draft invoice returns an empty list.
+         *
+         *     Each row carries `line`, the row in the activity line standard's
+         *     words (ADR-128). `description`, `detail`, `error`, `status` and
+         *     `amount_cents` repeat it for clients that read the older fields.
          *
          *     If one source cannot be read, the rest is still returned and the
          *     source is named in `degraded`.
          */
         get: operations["getInvoicePaymentTimeline"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/invoices/{id}/disputes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the card disputes on an invoice
+         * @description Returns the card disputes (chargebacks) Stripe reported against the
+         *     invoice's payments, oldest first. An invoice without any returns an
+         *     empty list. Velox records them from Stripe's `charge.dispute.*`
+         *     webhook events, which must be turned on for the Stripe webhook
+         *     endpoint. Velox never changes the invoice because of a dispute:
+         *     respond to it in Stripe, and if it is lost, record the loss with a
+         *     credit note or a write-off in your books.
+         */
+        get: operations["listInvoiceDisputes"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3964,13 +4005,17 @@ export interface paths {
         /**
          * Issue a draft credit note
          * @description Moves a `draft` credit note to `issued` and applies it.
-         *     - Unpaid invoice: the invoice's amount due goes down.
+         *     - Unpaid invoice: the invoice's amount due goes down. If nothing is
+         *       left due, the invoice is marked `paid` and `invoice.paid` is sent,
+         *       unless a charge is running on it.
          *     - Paid invoice: the refund part is sent to Stripe, and the credit
          *       part is added to the customer's credit balance.
          *
          *     Check the returned `status` and `refund_status`:
-         *     - A failed Stripe refund still returns 200, with `refund_status`
-         *       `failed`. Retry it with `POST /v1/credit-notes/{id}/retry-refund`.
+         *     - A refund Stripe refused still returns 200, with `refund_status`
+         *       `failed`. A refund with no clear answer from Stripe returns 200
+         *       with `unknown`: the customer may already be refunded. Retry either
+         *       with `POST /v1/credit-notes/{id}/retry-refund`.
          *     - If the invoice's charge is still running, or the invoice is still
          *       a draft, nothing changes and the note stays `draft`. Velox issues
          *       it later.
@@ -3996,10 +4041,13 @@ export interface paths {
         /**
          * Retry a failed credit-note refund
          * @description Sends the refund part of an `issued` credit note to Stripe again,
-         *     when its `refund_status` is `failed`, `pending` or `none`. Before
-         *     creating a refund, Velox asks Stripe for one already made for this
-         *     note and records it if found, so a retry does not refund the
-         *     customer twice.
+         *     when its `refund_status` is `failed`, `unknown`, `pending` or
+         *     `none`. Before creating a refund, Velox asks Stripe for one already
+         *     made for this note and records it if found. For `unknown` and
+         *     `none`, Velox then resends the earlier request whose result it
+         *     never recorded, with the same idempotency key. While Stripe keeps
+         *     that key (at least 24 hours), Stripe returns the earlier request's
+         *     result instead of making a second refund.
          */
         post: operations["retryCreditNoteRefund"];
         delete?: never;
@@ -4125,6 +4173,12 @@ export interface paths {
          *     `attention`) on success or post-retry failure. A retry that
          *     is still failing is **not** an HTTP error — the caller
          *     renders the new attention.
+         *
+         *     When the tax resolves on an invoice the billing engine made,
+         *     the call also finalizes it, unless collection is paused on its
+         *     subscription. If that finalize fails, the call returns 500 or
+         *     409 and the invoice stays a draft with its tax saved: finalize
+         *     it.
          */
         post: {
             parameters: {
@@ -4164,7 +4218,9 @@ export interface paths {
                 };
                 /**
                  * @description Invoice is not in a retryable state (status != draft, or
-                 *     tax_status not in pending/failed).
+                 *     tax_status not in pending/failed). Also returned when the
+                 *     tax was saved but the invoice's state then stopped the
+                 *     finalize.
                  */
                 409: {
                     headers: {
@@ -5523,7 +5579,12 @@ export interface paths {
          *     leaves `advancing`. Concurrent advances 409 while catchup runs.
          *     Catchup failures park the clock in `internal_failure` — resume
          *     it with `POST /v1/test-clocks/{id}/retry-advance` (deletion is
-         *     not required). ADR-018.
+         *     not required). ADR-018. Catchup bills every skipped period
+         *     before it runs payment retries and dunning, so when a dunning
+         *     policy cancels or pauses a subscription, advance to the time of
+         *     the invoice's last retry first, then to the next billing date.
+         *     The cancel or pause is dated at the advance target, and one
+         *     longer advance bills a period a real clock would not (#1276).
          */
         post: {
             parameters: {
@@ -5568,7 +5629,7 @@ export interface paths {
                     };
                     content?: never;
                 };
-                /** @description New frozen_time is not strictly after the current */
+                /** @description New frozen_time is not strictly after the current frozen_time, or is more than one year after it */
                 422: {
                     headers: {
                         [name: string]: unknown;
@@ -7062,8 +7123,13 @@ export interface components {
         /**
          * @description Payment-attempt status. `unknown` marks a Stripe charge attempt that
          *     returned an ambiguous error (5xx, timeout, connection reset) where
-         *     we cannot tell whether Stripe processed the charge — a reconciler
-         *     resolves these by querying Stripe after a cool-off window.
+         *     we cannot tell whether Stripe processed the charge. With a payment
+         *     intent recorded, Velox asks Stripe for it after a short wait. With
+         *     none (a parked invoice), Velox lists the customer's payments at
+         *     Stripe every billing tick: it records a payment for the invoice that
+         *     appears, and if none has appeared 24 hours after the attempt the
+         *     invoice goes back to `pending` (`failed` after a dunning retry) and
+         *     is charged again as usual.
          * @enum {string}
          */
         InvoicePaymentStatus: "pending" | "processing" | "succeeded" | "failed" | "unknown";
@@ -7104,10 +7170,20 @@ export interface components {
          *     reason applies; when one does, the exposure is folded into that
          *     reason's `message` and its `actions` instead, so clients must
          *     not treat the reason code as the presence test for exposure
-         *     (2026-08-04).
+         *     (2026-08-04). `dispute_lost` reports a payment on the invoice that
+         *     the customer disputed with their bank and that the dispute took
+         *     back (the dispute closed as `lost`). Velox leaves the invoice paid
+         *     and moves no money; the operator records the loss. Surfaced on paid
+         *     invoices. On an invoice that bought prepaid credit, the message
+         *     also says how much of the credit is still spendable and names
+         *     commit relief, because an ordinary credit note is refused there.
+         *     When the invoice also has `payment_anomaly`, that reason stays and
+         *     its message asks the operator to check Stripe before any refund.
+         *     The disputes themselves are at `GET /v1/invoices/{id}/disputes`
+         *     (2026-10-19).
          * @enum {string}
          */
-        AttentionReason: "tax_calculation_failed" | "tax_location_required" | "payment_failed" | "payment_unconfirmed" | "payment_anomaly" | "payment_processing" | "payment_scheduled" | "awaiting_payment" | "no_payment_method" | "dunning_exhausted" | "collection_paused" | "commit_exposure";
+        AttentionReason: "tax_calculation_failed" | "tax_location_required" | "payment_failed" | "payment_unconfirmed" | "payment_anomaly" | "payment_processing" | "payment_scheduled" | "awaiting_payment" | "no_payment_method" | "dunning_exhausted" | "collection_paused" | "commit_exposure" | "dispute_lost";
         /**
          * @description What an operator must know BEFORE recording an OFFLINE payment on a
          *     written-off invoice (`status = uncollectible`) — a consequence that
@@ -7115,8 +7191,9 @@ export interface components {
          *     refusing to record it would only make the books wrong too.
          *
          *     A written-off invoice is settled by RECORDING writers only — an
-         *     offline payment, or the provider-search reconciler adopting a charge
-         *     that turns out to have succeeded (ADR-108). Nothing initiates a card
+         *     offline payment, or Velox recording a card charge that Stripe shows
+         *     succeeded (its webhook, or the check of an unresolved charge).
+         *     Nothing initiates a card
          *     charge against one (ADR-113): recovery of a returned customer runs on
          *     normal rails via a fresh recovery invoice.
          *
@@ -7143,9 +7220,11 @@ export interface components {
          *     and audit logs key off the code. `reconcile_payment` opens the
          *     payment in Stripe; it is offered on `payment_anomaly`, where the
          *     refund or correction is made there. `mark_uncollectible` opens
-         *     the write-off and is offered only when a payment's outcome can
-         *     never be identified (payment status unknown with no payment
-         *     intent recorded). `void_invoice` is offered only
+         *     the write-off and is offered only on a parked invoice (payment
+         *     status unknown with no payment intent recorded), for a customer
+         *     who paid another way: Velox records a payment that Stripe shows,
+         *     and charges the invoice again if none appears within 24 hours.
+         *     Dashboards render it as a secondary action. `void_invoice` is offered only
          *     on prepaid-commit exposure, and only while some of the granted
          *     credit is still unspent: voiding retires the unspent balance
          *     (ADR-078) and is the sole recovery for an unpaid invoice whose
@@ -7428,12 +7507,17 @@ export interface components {
             /**
              * @description Stripe's PaymentIntent status the last time Velox checked it,
              *     word for word. For information only: `payment_status` is the
-             *     invoice's payment state. Absent until Velox has checked.
+             *     invoice's payment state. Absent until Velox has checked. An
+             *     invoice checked by the Stripe Search sweep of releases before
+             *     this one may still show `search_not_found`,
+             *     `search_terminal_only` or `search_error`.
              */
             provider_payment_status?: string;
             /**
              * Format: date-time
-             * @description When Velox last checked `provider_payment_status`.
+             * @description When Velox last asked Stripe about this invoice's payment, whether
+             *     or not Stripe answered: a read of `provider_payment_status`, or a
+             *     check of a charge whose result was lost.
              */
             provider_synced_at?: string;
             /**
@@ -7510,7 +7594,10 @@ export interface components {
              * @description Stripe-canonical structured `taxability_reason`
              *     (`standard_rated`, `reverse_charge`, `not_collecting`,
              *     `customer_exempt`, `product_exempt`, `zero_rated`, etc.).
-             *     Empty for non-Stripe providers.
+             *     `prepaid_credit_purchase` is Velox's own value, on a prepaid
+             *     commit purchase line under the manual or Stripe Tax provider:
+             *     the line is not taxed, and the usage the credit pays for is
+             *     taxed when invoiced. Otherwise empty for non-Stripe providers.
              */
             tax_reason?: string;
             /** Format: int64 */
@@ -7898,6 +7985,16 @@ export interface components {
             created_at: string;
             /** Format: date-time */
             dispatched_at?: string;
+            /**
+             * @description The email in the words of the activity line standard (ADR-128),
+             *     the same as on the invoice's payment timeline: its name and
+             *     what happened to it ("Receipt email delivered"), why it was not
+             *     sent, the invoice it was about, and who it went to. Dated at the
+             *     time on the customer's test clock that caused it, with the real
+             *     send time as `recorded_at`. Present for every email type this
+             *     list returns.
+             */
+            line?: components["schemas"]["ActivityLine"];
         };
         CustomerUsage: {
             customer_id: string;
@@ -8178,17 +8275,26 @@ export interface components {
             source: "audit";
             /** @description The audit action, e.g. `create`, `cancel`, `subscription.item_updated`. */
             event_type: string;
-            /** @description Display tone for the row: `info`, `succeeded`, `success` (scheduled plan change applied), `warning` or `canceled`. */
-            status: string;
-            /** @description One-line summary, e.g. "Subscription canceled". */
+            /**
+             * @description The line's tone in older words, read by the dashboard's dot.
+             * @enum {string}
+             */
+            status: "neutral" | "succeeded" | "warning" | "failed";
+            /** @description The line's title, for example "Subscription canceled". */
             description: string;
-            /** @description Optional second line with context. */
+            /**
+             * @description The line's meta line as text, without the actor (see
+             *     `actor_name`) and without a date at its end, which is in
+             *     `detail_timestamp`. For example "Starter → Pro".
+             */
             detail?: string;
             /**
              * Format: date-time
-             * @description The instant `detail` refers to, for the client to format.
+             * @description The date the end of `detail` refers to, for the client to format, as in "Trial now ends" followed by this date.
              */
             detail_timestamp?: string;
+            /** @description The line's problem. */
+            error?: string;
             actor_type?: string;
             actor_name?: string;
             actor_id?: string;
@@ -8200,6 +8306,7 @@ export interface components {
              */
             sim_effective_at?: string;
             test_clock_id?: string;
+            line: components["schemas"]["ActivityLine"];
         };
         /**
          * @default 30d
@@ -8241,7 +8348,7 @@ export interface components {
             date: string;
             /**
              * Format: int64
-             * @description Sum of invoice totals paid in the bucket.
+             * @description What paid the invoices paid in the bucket (payment plus customer credit applied). A credit note that lowered an invoice before it was paid is not counted.
              */
             revenue_cents: number;
             invoice_count: number;
@@ -8294,12 +8401,12 @@ export interface components {
             arr_prev: number;
             /**
              * Format: int64
-             * @description Total of invoices paid in the window.
+             * @description What paid the invoices paid in the window (payment plus customer credit applied). A credit note that lowered an invoice before it was paid is not counted.
              */
             revenue: number;
             /**
              * Format: int64
-             * @description Total of invoices paid in the previous window.
+             * @description `revenue` for the previous window.
              */
             revenue_prev: number;
             /**
@@ -8357,8 +8464,9 @@ export interface components {
             /** @description Dunning runs (automatic payment retries) still in progress. */
             dunning_active: number;
             /**
-             * @description Issued credit notes whose refund failed, has been pending for
-             *     more than 72 hours, or has not started an hour after issue.
+             * @description Issued credit notes whose refund failed, has an unknown result,
+             *     has been pending for more than 72 hours, or has not started an
+             *     hour after issue.
              */
             refunds_needing_attention: number;
             /**
@@ -8473,8 +8581,17 @@ export interface components {
             issued_at?: string;
             /** Format: date-time */
             voided_at?: string;
-            /** @enum {string} */
-            refund_status: "none" | "pending" | "succeeded" | "failed";
+            /**
+             * @description The refund part's state at Stripe. `unknown`: Stripe gave no
+             *     clear answer (a timeout, a network error, a Stripe 5xx, a 409 or
+             *     a 429), so the customer may already be refunded. Don't refund it
+             *     again in the Stripe Dashboard. Retry it with
+             *     `POST /v1/credit-notes/{id}/retry-refund`, which looks for the
+             *     refund at Stripe first and then resends the same request with
+             *     the same idempotency key.
+             * @enum {string}
+             */
+            refund_status: "none" | "pending" | "succeeded" | "failed" | "unknown";
             stripe_refund_id?: string;
             bill_to_snapshot?: components["schemas"]["DocumentBillTo"];
             supplier_snapshot?: components["schemas"]["DocumentSupplier"];
@@ -8499,20 +8616,105 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /**
+         * @description One activity row in the words of the activity line standard
+         *     (ADR-128): a title with no values, the amount when the event moves
+         *     money, asks for it or cancels money owed, a problem line on failure
+         *     and warning rows, the meta line's parts and the actor, a tone, and
+         *     the event's time on the entity's calendar. `recorded_at` is the
+         *     real-world time, set only for an entity on a test clock.
+         */
+        ActivityLine: {
+            /**
+             * @description The row's stable key: the event's `id` on an invoice timeline
+             *     row, the audit entry's id on a subscription timeline row,
+             *     `dunning:` and the event's id on a dunning run event (the same
+             *     key the invoice timeline gives that event), and `email:` and
+             *     the email's id on a sent email (likewise).
+             */
+            id: string;
+            /**
+             * @description Machine name of the event.
+             * @example invoice.voided
+             */
+            kind: string;
+            /** @example Payment failed */
+            title: string;
+            amount?: components["schemas"]["ActivityMoney"];
+            /** @example Card declined: insufficient funds */
+            problem?: string;
+            /**
+             * @description The meta line before the actor. Each item is one segment, shown
+             *     joined by " · "; a segment's parts read as one phrase, for
+             *     example a money part followed by the text " refunded to card".
+             */
+            detail: components["schemas"]["ActivityPart"][][];
+            actor?: components["schemas"]["ActivityActor"];
+            /**
+             * @description neutral: something happened. success: money arrived, or was
+             *     returned as intended. warning: needs a look, or money will not
+             *     be collected. failure: an attempt failed.
+             * @enum {string}
+             */
+            tone: "neutral" | "success" | "warning" | "failure";
+            /** Format: date-time */
+            occurred_at: string;
+            /** Format: date-time */
+            recorded_at?: string;
+        };
+        ActivityMoney: {
+            /** Format: int64 */
+            cents: number;
+            /** @example USD */
+            currency: string;
+        };
+        /** @description One piece of a meta segment. Exactly one field is set. */
+        ActivityPart: {
+            text?: string;
+            money?: components["schemas"]["ActivityMoney"];
+            /** Format: date-time */
+            time?: string;
+            link?: components["schemas"]["ActivityLink"];
+        };
+        /** @description An object the row's own data names, which still exists. */
+        ActivityLink: {
+            /** @enum {string} */
+            kind: "invoice" | "credit_note" | "subscription";
+            id: string;
+            label: string;
+        };
+        /**
+         * @description Who did it. `person` and `api_key` carry the name (a person's email
+         *     when they have no name), `customer` says where through `via`, and
+         *     `automatic` is anything Velox did on its own. Absent when no fact
+         *     written with the row names one.
+         */
+        ActivityActor: {
+            /** @enum {string} */
+            kind: "person" | "api_key" | "customer" | "automatic";
+            name?: string;
+            /** @enum {string} */
+            via?: "payment_page" | "portal";
+        };
         InvoiceTimelineEvent: {
             /** @description Stable key for the row. */
             id: string;
             /** Format: date-time */
             timestamp: string;
             /** @enum {string} */
-            source: "lifecycle" | "payment" | "dunning" | "email" | "credit_note";
+            source: "lifecycle" | "payment" | "dunning" | "email" | "credit_note" | "dispute";
             /** @example invoice.finalized */
             event_type: string;
-            /** @description Display status, for example succeeded, failed, resolved, escalated or info. */
-            status: string;
+            /**
+             * @description The line's tone in older words, read by the dashboard's dot.
+             * @enum {string}
+             */
+            status: "neutral" | "succeeded" | "warning" | "failed";
+            /** @description The line's title. */
             description: string;
-            /** @description Extra line shown under the description, for example the card used. */
+            /** @description The line's meta line as text, its actor last, for example "Visa •••• 4242 · After 2 retries". */
             detail?: string;
+            /** @description The line's problem. */
             error?: string;
             /** Format: int64 */
             amount_cents?: number;
@@ -8526,11 +8728,111 @@ export interface components {
              * @description Real-world time of a row whose `timestamp` is test-clock time.
              */
             recorded_at?: string;
+            line: components["schemas"]["ActivityLine"];
+        };
+        /**
+         * @description A card dispute (chargeback) Stripe reported against one of the
+         *     invoice's payments, recorded from Stripe's `charge.dispute.created`,
+         *     `.updated` and `.closed` webhook events. It holds the dispute as the
+         *     newest of those events showed it, whatever order they arrived in.
+         *     Velox records and reports a dispute, and nothing else: the invoice
+         *     stays paid and no money moves.
+         */
+        InvoiceDispute: {
+            /** @example vlx_dsp_6f1c0a7e9b2d4c8e1a3b5d7f */
+            id: string;
+            invoice_id: string;
+            /** @example du_1MtJUT2eZvKYlo2CNaw2HvEv */
+            stripe_dispute_id: string;
+            stripe_charge_id?: string;
+            /** @description The disputed payment. */
+            stripe_payment_intent_id: string;
+            /**
+             * @description Stripe's dispute status, as Stripe sends it. The `warning_`
+             *     statuses are an inquiry, which comes before a chargeback or
+             *     instead of one. `won`, `lost`, `warning_closed` and `prevented`
+             *     are closed.
+             * @enum {string}
+             */
+            status: "warning_needs_response" | "warning_under_review" | "warning_closed" | "needs_response" | "under_review" | "won" | "lost" | "prevented";
+            /** @description The reason the cardholder gave, for example `fraudulent`. */
+            reason?: string;
+            /**
+             * Format: int64
+             * @description The disputed amount. It can differ from the payment.
+             */
+            amount_cents: number;
+            /** @example USD */
+            currency: string;
+            /**
+             * Format: date-time
+             * @description The deadline to respond in Stripe. Absent when Stripe gave none.
+             */
+            evidence_due_by?: string;
+            /**
+             * Format: date-time
+             * @description When Stripe opened the dispute.
+             */
+            opened_at: string;
+            /**
+             * Format: date-time
+             * @description When Stripe closed it. Absent while it is open.
+             */
+            closed_at?: string;
+            livemode: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        InvoiceDisputeList: {
+            data: components["schemas"]["InvoiceDispute"][];
+        };
+        /**
+         * @description The `data` of the outbound webhook events `payment.dispute_opened`
+         *     and `payment.dispute_closed` (docs/webhooks.md). Both are saved in the
+         *     same transaction that records the dispute, so a crash cannot drop
+         *     them. `payment.dispute_opened` is sent once per dispute, when Velox
+         *     first records it; if the first event Velox receives is already the
+         *     close, both are sent, and both carry the closed status and
+         *     `closed_at`. Their delivery order is not guaranteed.
+         *     `payment.dispute_closed` is sent when the dispute reaches a closed
+         *     status it did not have: `won`, `lost`, `warning_closed` or
+         *     `prevented`. A lost dispute that Stripe later marks won sends it
+         *     again.
+         */
+        DisputeWebhookEventData: {
+            invoice_id: string;
+            invoice_number: string;
+            customer_id: string;
+            /** @description The Velox dispute record (`InvoiceDispute.id`). */
+            dispute_id: string;
+            stripe_dispute_id: string;
+            stripe_charge_id?: string;
+            /** @description The disputed Stripe PaymentIntent. */
+            payment_intent_id: string;
+            /** @description The dispute's status when the event was saved (see `InvoiceDispute.status`). */
+            status: string;
+            reason?: string;
+            /** Format: int64 */
+            amount_cents: number;
+            currency: string;
+            /** Format: date-time */
+            evidence_due_by?: string;
+            /** Format: date-time */
+            opened_at: string;
+            /**
+             * Format: date-time
+             * @description Set when the dispute is closed: always on `payment.dispute_closed`,
+             *     and on `payment.dispute_opened` when the first event Velox received
+             *     was already the close.
+             */
+            closed_at?: string;
         };
         InvoicePaymentTimeline: {
             events: components["schemas"]["InvoiceTimelineEvent"][];
             /** @description Sources that could not be read, so their rows are missing. */
-            degraded: ("audit" | "credit_notes" | "emails" | "dunning" | "charge_attempts")[];
+            degraded: ("audit" | "credit_notes" | "emails" | "dunning" | "charge_attempts" | "disputes")[];
             /** @description True when the credit-note source hit its limit of 100 rows. */
             truncated: boolean;
         };
@@ -8599,10 +8901,26 @@ export interface components {
             created_at: string;
             /** Format: date-time */
             recorded_at?: string;
+            /**
+             * @description The event in the words of the activity line standard (ADR-128):
+             *     the line the invoice's payment timeline shows for the same
+             *     event, without that timeline's folds. Absent when the run's
+             *     invoice could not be read (`degraded` names `invoice`).
+             */
+            line?: components["schemas"]["ActivityLine"];
         };
         DunningRunDetail: {
             run: components["schemas"]["DunningRun"];
             events: components["schemas"]["DunningRunEvent"][];
+            /**
+             * @description Sources that could not be read. `events`: the event history, so
+             *     `events` is empty. `invoice`: the run's invoice, so no event has
+             *     a `line`. The others leave the lines without what they would
+             *     add: `emails` the reminder and final-notice clauses,
+             *     `charge_attempts` the decline reason and amount, `audit` who
+             *     resolved the run.
+             */
+            degraded: ("events" | "invoice" | "emails" | "charge_attempts" | "audit")[];
         };
         DunningStats: {
             active_count: number;
@@ -9265,7 +9583,7 @@ export interface components {
         };
         WebhookEventDeliveryAttempt: {
             id: string;
-            /** @description The event this delivery sent. A replay's own id when `is_replay` is true. */
+            /** @description The event this delivery belongs to. When `is_replay` is true, the replay's own id; the message it sent carries the original event's `id` (`root_event_id`). */
             event_id: string;
             endpoint_id: string;
             endpoint_url: string;
@@ -9333,7 +9651,7 @@ export interface components {
             tenant_id?: string;
             livemode: boolean;
             webhook_endpoint_id: string;
-            /** @description The event this delivery sent. A replay's own id for a replay's delivery. */
+            /** @description The event this delivery belongs to. For a replay's delivery, the replay's own id; the message it sent carries the original event's `id`. */
             webhook_event_id: string;
             /** @enum {string} */
             status: "pending" | "succeeded" | "failed";
@@ -9583,6 +9901,11 @@ export interface components {
             livemode: boolean;
             /** @example invoice.finalized */
             event_type: string;
+            /**
+             * @description The event's data. docs/webhooks.md lists what each event carries;
+             *     `payment.dispute_opened` and `payment.dispute_closed` carry a
+             *     `DisputeWebhookEventData`.
+             */
             payload: {
                 [key: string]: unknown;
             };
@@ -11045,10 +11368,11 @@ export interface operations {
                 status?: "draft" | "issued" | "voided";
                 /**
                  * @description `needs_attention` returns issued, non-test-clock notes whose
-                 *     refund failed, has been pending more than 72 hours, or has a
-                 *     refund amount still at `none` after 1 hour.
+                 *     refund failed or has an unknown result, has been pending more
+                 *     than 72 hours, or has a refund amount still at `none` after 1
+                 *     hour.
                  */
-                refund_status?: "none" | "pending" | "succeeded" | "failed" | "needs_attention";
+                refund_status?: "none" | "pending" | "succeeded" | "failed" | "unknown" | "needs_attention";
                 /** @description One of credit_note_number, total_cents (alias amount), status, issued_at, created_at (default). */
                 sort?: string;
                 dir?: "asc" | "desc";
@@ -12634,8 +12958,11 @@ export interface operations {
              *     an unpaid invoice for the current period; settle or void it
              *     first. Code `subscription_period_moved`: the billing period
              *     changed while the request ran; read the subscription again and
-             *     retry. Code `unbilled_period`: a billing period ended and could
-             *     not be invoiced; retry billing first.
+             *     retry. Code `item_changed`: a plan change found the
+             *     subscription's items changed by another request that finished
+             *     first; read the subscription again and retry. Code
+             *     `unbilled_period`: a billing period ended and could not be
+             *     invoiced; retry billing first.
              */
             409: {
                 headers: {
@@ -13293,8 +13620,8 @@ export interface operations {
              * @description The invoice cannot be voided in its current state. Codes:
              *     `invalid_state` (already paid or already voided),
              *     `payment_in_flight` (a charge is still running), or
-             *     `payment_unidentifiable` (a charge's outcome could not be
-             *     identified; write the invoice off instead).
+             *     `payment_unidentifiable` (Stripe's answer to a charge was unclear
+             *     and named no payment; Velox finds out from Stripe within a day).
              */
             409: {
                 headers: {
@@ -13574,8 +13901,13 @@ export interface operations {
                 };
             };
             /**
-             * @description An earlier charge has an unknown outcome and must be resolved
-             *     first. Code `payment_in_flight` or `payment_unidentifiable`.
+             * @description An earlier charge must be resolved first. Code
+             *     `payment_in_flight`: a charge on the invoice is running, or its
+             *     result was lost and Velox is confirming it with Stripe (within
+             *     about an hour). Code `payment_unidentifiable`: Stripe's answer
+             *     to the earlier charge was unclear and named no payment; Velox
+             *     records a payment that appears, and the invoice is charged again
+             *     as usual if none has appeared 24 hours after that charge.
              */
             409: {
                 headers: {
@@ -13587,8 +13919,8 @@ export interface operations {
             };
             /**
              * @description Code `validation_error`. The invoice is not finalized, is already
-             *     paid, or has no amount due; another charge is already running;
-             *     payments are not configured; or the customer has no payment
+             *     paid, or has no amount due; the customer is paying on the hosted
+             *     page; payments are not configured; or the customer has no payment
              *     method set up.
              */
             422: {
@@ -13602,9 +13934,12 @@ export interface operations {
             /**
              * @description Stripe declined or refused the charge (code `provider_error`),
              *     so nothing was charged. The message gives the reason in plain
-             *     words. Code `payment_outcome_unknown`: Stripe never answered,
-             *     so the card may have been charged; Velox checks with Stripe and
-             *     updates the invoice. Do not retry until it does.
+             *     words. Code `stripe_key_unusable`: Stripe refused this account's
+             *     API key, or none is connected for this mode; nothing was charged
+             *     and the invoice is unchanged. Update the key under Settings →
+             *     Payments, then retry. Code `payment_outcome_unknown`: Stripe never
+             *     answered, so the card may have been charged; Velox checks with
+             *     Stripe and updates the invoice. Do not retry until it does.
              */
             502: {
                 headers: {
@@ -13722,6 +14057,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InvoicePaymentTimeline"];
+                };
+            };
+            /** @description Invoice not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listInvoiceDisputes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The invoice's disputes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InvoiceDisputeList"];
                 };
             };
             /** @description Invoice not found. */
@@ -13869,9 +14235,10 @@ export interface operations {
                 };
             };
             /**
-             * @description Stripe refused the refund again (code `provider_error`). The
-             *     note keeps `refund_status` `failed`; retry later. A Stripe error
-             *     without a safe message returns 500 instead.
+             * @description Stripe refused the refund (code `provider_error`): the note's
+             *     `refund_status` is `failed`. Or Stripe gave no clear answer (code
+             *     `payment_outcome_unknown`): it is `unknown`, and the customer may
+             *     already be refunded. Retry later in both cases.
              */
             502: {
                 headers: {
@@ -14797,7 +15164,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The run and its event history. `events` is empty if the event history could not be read. */
+            /** @description The run and its event history. `events` is empty if the event history could not be read, and `degraded` then names it. */
             200: {
                 headers: {
                     [name: string]: unknown;
