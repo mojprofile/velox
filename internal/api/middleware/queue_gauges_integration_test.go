@@ -2,9 +2,11 @@ package middleware_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,13 +19,15 @@ import (
 )
 
 // The gauges register on the default Prometheus registry, which refuses a
-// second registration. Both tests in this file therefore share one
+// second registration. Tests in this file therefore share one
 // registration whose count function reads through gaugeDB, the database of
-// whichever test is running.
+// whichever test is running. The query-error test temporarily supplies a
+// stub through gaugeCountStub; these tests must not run in parallel.
 var (
-	gaugeOnce   sync.Once
-	gaugeDB     *postgres.DB
-	gaugeFailed []string
+	gaugeOnce      sync.Once
+	gaugeDB        *postgres.DB
+	gaugeFailed    []string
+	gaugeCountStub func(string) (float64, error)
 )
 
 // registerGauges wires the gauges the way router.go does: a BYPASS tx per
@@ -32,6 +36,9 @@ func registerGauges(db *postgres.DB) {
 	gaugeDB, gaugeFailed = db, nil
 	gaugeOnce.Do(func() {
 		mw.RegisterQueueDepthGauges(time.Hour, func(query string) (float64, error) {
+			if gaugeCountStub != nil {
+				return gaugeCountStub(query)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			tx, err := gaugeDB.BeginTx(ctx, postgres.TxBypass, "")
@@ -47,6 +54,28 @@ func registerGauges(db *postgres.DB) {
 			return n, nil
 		})
 	})
+}
+
+func TestQueueDepthGauges_WebhookQueryError(t *testing.T) {
+	var queried atomic.Int32
+	gaugeCountStub = func(query string) (float64, error) {
+		if strings.Contains(query, "FROM webhook_outbox") && strings.Contains(query, "MIN(created_at)") {
+			queried.Add(1)
+			return 0, errors.New("database unavailable")
+		}
+		return 0, nil
+	}
+	t.Cleanup(func() { gaugeCountStub = nil })
+	registerGauges(nil)
+
+	for _, mode := range []string{"live", "test"} {
+		if got := gaugeValue(t, "velox_webhook_outbox_oldest_pending_age_seconds", map[string]string{"mode": mode}); got != -1 {
+			t.Errorf("webhook oldest pending age (%s) = %v, want -1 on query error", mode, got)
+		}
+	}
+	if got := queried.Load(); got == 0 {
+		t.Error("webhook age query was not called")
+	}
 }
 
 // TestQueueDepthGauges_EveryQueryRunsOnRealPostgres runs every scrape-time

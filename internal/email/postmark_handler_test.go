@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -277,6 +278,27 @@ func TestPostmarkWebhook_TransientFailures5xx(t *testing.T) {
 			t.Errorf("suppressor error: got %d, want 500", rec.Code)
 		}
 	})
+}
+
+type failingBodyReader struct{}
+
+func (failingBodyReader) Read([]byte) (int, error) { return 0, errors.New("body read failed") }
+
+func TestPostmarkWebhook_BodyReadErrorIsRetryable(t *testing.T) {
+	store := &fakeDeliveryStore{}
+	h := NewPostmarkHandler(store, "pmuser", "pmpass")
+	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/postmark", nil)
+	req.Body = io.NopCloser(failingBodyReader{})
+	goodAuth(req)
+
+	rec := httptest.NewRecorder()
+	h.HandleWebhook(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("body read error: got %d, want 500 for provider retry", rec.Code)
+	}
+	if store.gets != 0 {
+		t.Errorf("store lookups = %d, want 0 when request body cannot be read", store.gets)
+	}
 }
 
 // TestPostmarkWebhook_NilSuppressorDegrades: without a blind-index key

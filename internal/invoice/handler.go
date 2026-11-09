@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,11 +50,13 @@ type CreditNoteLister interface {
 	List(ctx context.Context, tenantID, invoiceID string) ([]domain.CreditNote, error)
 }
 
-// PaymentCharger creates a Stripe PaymentIntent for a finalized invoice.
+// PaymentCharger creates a Stripe PaymentIntent for a finalized invoice on
+// an operator's or API caller's request (Collect payment, "Charge now").
 type PaymentCharger interface {
+	// ChargeInvoiceNow records its attempt as charge_now, not auto_charge.
 	// hold is the charge hold the caller's claim returned (ADR-127): the
 	// charge re-checks it right before sending and sends nothing without it.
-	ChargeInvoice(ctx context.Context, tenantID string, inv domain.Invoice, hold domain.ChargeHold, stripeCustomerID, stripePaymentMethodID string) (domain.Invoice, error)
+	ChargeInvoiceNow(ctx context.Context, tenantID string, inv domain.Invoice, hold domain.ChargeHold, stripeCustomerID, stripePaymentMethodID string) (domain.Invoice, error)
 }
 
 // PaymentSetupGetter checks if a customer has a payment method ready.
@@ -385,8 +386,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	tenantID := auth.TenantID(r.Context())
 
 	var input CreateInput
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		respond.BadRequest(w, r, "invalid JSON body")
+	if !respond.DecodeStrict(w, r, &input) {
 		return
 	}
 
@@ -443,8 +443,7 @@ func (h *Handler) addLineItem(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	var input AddLineItemInput
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		respond.BadRequest(w, r, "invalid JSON body")
+	if !respond.DecodeStrict(w, r, &input) {
 		return
 	}
 
@@ -814,6 +813,11 @@ func (h *Handler) markUncollectible(w http.ResponseWriter, r *http.Request) {
 	respond.JSON(w, r, http.StatusOK, inv)
 }
 
+// RecordPaymentInput is the POST /v1/invoices/{id}/record-payment body.
+type RecordPaymentInput struct {
+	Note string `json:"note"`
+}
+
 // recordOfflinePayment flips an unpaid (or uncollectible) invoice to
 // paid based on operator-recorded out-of-band collection (cheque,
 // wire, cash). Stripe-parity: their paid_out_of_band=true flag on
@@ -831,9 +835,7 @@ func (h *Handler) recordOfflinePayment(w http.ResponseWriter, r *http.Request) {
 	tenantID := auth.TenantID(r.Context())
 	id := chi.URLParam(r, "id")
 
-	var input struct {
-		Note string `json:"note"`
-	}
+	var input RecordPaymentInput
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			respond.BadRequest(w, r, "invalid JSON body")
@@ -910,19 +912,22 @@ func (h *Handler) rotatePublicToken(w http.ResponseWriter, r *http.Request) {
 	respond.JSON(w, r, http.StatusOK, inv)
 }
 
+// SendEmailInput is the POST /v1/invoices/{id}/send body.
+type SendEmailInput struct {
+	Email string `json:"email"`
+	// AdditionalEmails overrides the CC list for THIS send
+	// (ADR-082): absent → the customer's stored additional_emails;
+	// explicit [] → primary only; explicit list → validated exact
+	// override. Legacy {email}-only bodies therefore now CC the
+	// stored list — the Orb-parity default.
+	AdditionalEmails *[]string `json:"additional_emails,omitempty"`
+}
+
 func (h *Handler) sendEmail(w http.ResponseWriter, r *http.Request) {
 	tenantID := auth.TenantID(r.Context())
 	id := chi.URLParam(r, "id")
 
-	var body struct {
-		Email string `json:"email"`
-		// AdditionalEmails overrides the CC list for THIS send
-		// (ADR-082): absent → the customer's stored additional_emails;
-		// explicit [] → primary only; explicit list → validated exact
-		// override. Legacy {email}-only bodies therefore now CC the
-		// stored list — the Orb-parity default.
-		AdditionalEmails *[]string `json:"additional_emails,omitempty"`
-	}
+	var body SendEmailInput
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Email == "" {
 		respond.BadRequest(w, r, "email is required")
 		return
@@ -1183,7 +1188,7 @@ func (h *Handler) collectPayment(w http.ResponseWriter, r *http.Request) {
 	// velox_anchor_at), which dates paid_at and a decline's first dunning
 	// retry. Unbound, a Collect on a later Advance dated the retry from the
 	// issue instant, in the past. A wall-clock invoice binds nothing.
-	charged, err := h.charger.ChargeInvoice(h.svc.bindForInvoice(r.Context(), tenantID, id), tenantID, inv, hold, ps.StripeCustomerID, ps.StripePaymentMethodID)
+	charged, err := h.charger.ChargeInvoiceNow(h.svc.bindForInvoice(r.Context(), tenantID, id), tenantID, inv, hold, ps.StripeCustomerID, ps.StripePaymentMethodID)
 	if err != nil {
 		// ADR-026 boundary sanitization: ChargeInvoice wraps a
 		// *payment.PaymentError which respond.FromError detects and
@@ -1235,6 +1240,14 @@ func (h *Handler) resolveDunningRecovered(ctx context.Context, tenantID, invoice
 	}
 }
 
+// RefundRequest is the POST /v1/invoices/{id}/refund body. The handler turns
+// it into a RefundInput for the RefundIssuer.
+type RefundRequest struct {
+	AmountCents int64  `json:"amount_cents"`
+	Reason      string `json:"reason"`
+	Description string `json:"description"`
+}
+
 // refund issues a direct refund on a paid invoice. Convenience wrapper around
 // creditnote.Service.CreateRefund — the caller passes a reason + optional
 // amount and gets back the issued credit note (which carries the Stripe
@@ -1249,13 +1262,10 @@ func (h *Handler) refund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body struct {
-		AmountCents int64  `json:"amount_cents"`
-		Reason      string `json:"reason"`
-		Description string `json:"description"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		respond.BadRequest(w, r, "invalid JSON body")
+	var body RefundRequest
+	// Strict: amount_cents=0 means "refund everything still refundable", so a
+	// dropped `amount` key would be a full card refund.
+	if !respond.DecodeStrict(w, r, &body) {
 		return
 	}
 
@@ -1463,50 +1473,17 @@ func lifecycleAuditRows(entries []domain.AuditEntry) map[string]domain.AuditEntr
 	return out
 }
 
-// sortInvoiceTimeline orders events by their full-precision source
-// instant, breaking true same-instant ties by causal rank, and residual
-// ties by insertion order (SliceStable; callers append sources oldest-
-// first). Sorting the serialized second-truncated Timestamp string was
-// the 2026-07-19 inversion class: same-second pairs kept whatever
-// orientation their source query happened to use.
+// sortInvoiceTimeline orders the invoice's rows by timeline.Order, the one
+// ordering rule for activity surfaces (ADR-128): the full-precision instant
+// on the invoice's calendar, then the real sequence inside a same-instant
+// group whose every row has a recorded stamp (ADR-104 ordering amendment,
+// 2026-07-29), then the causal rank, then insertion order (callers append
+// sources oldest-first).
 func sortInvoiceTimeline(events []timelineEvent) {
-	timeline.SortStable(events,
+	timeline.Order(events,
 		func(e timelineEvent) time.Time { return e.sortAt },
+		func(e timelineEvent) time.Time { return e.recordedSort },
 		func(a, b timelineEvent) bool { return a.tieRank < b.tieRank })
-
-	// Reality pass (ADR-104 ordering amendment, 2026-07-29): within one
-	// story-instant group, order by the REAL sequence — the recorded
-	// stamps — so a frozen-clock invoice reads exactly like a wall-clock
-	// one whose displayed dates happen to coincide. Gated on GROUP
-	// COMPLETENESS: only when every row in the group carries a recorded
-	// stamp. A partially-stamped group is legacy data (pre-0162/0163/0164
-	// rows, or an engine path with no audit row), and placing bare rows
-	// against stamped ones would FABRICATE a sequence — those groups keep
-	// the causal ladder above, which is correct-but-canonical, never
-	// wrong. Equal recorded stamps (same-tx rows share Postgres's
-	// tx-stable now()) fall back to the ladder inside the group; the
-	// pre-pass ordering makes SliceStable's preserved order exactly
-	// ladder-then-insertion.
-	for lo := 0; lo < len(events); {
-		hi := lo + 1
-		for hi < len(events) && events[hi].sortAt.Equal(events[lo].sortAt) {
-			hi++
-		}
-		complete := true
-		for i := lo; i < hi; i++ {
-			if events[i].recordedSort.IsZero() {
-				complete = false
-				break
-			}
-		}
-		if complete && hi-lo > 1 {
-			group := events[lo:hi]
-			sort.SliceStable(group, func(a, b int) bool {
-				return group[a].recordedSort.Before(group[b].recordedSort)
-			})
-		}
-		lo = hi
-	}
 }
 
 type timelineEvent struct {

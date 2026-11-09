@@ -164,6 +164,11 @@ func (e *Engine) dispatchEvent(ctx context.Context, tenantID, eventType string, 
 // The operator HTTP path and the tax-retry auto-finalize get their row from
 // invoice.Service.Finalize; engine invoices never pass through Finalize — they
 // are born finalized — so without this they leave no audit trace at all.
+//
+// born_finalized marks the row as one of those: the invoice was finalized in
+// the statement that created it, never a draft someone finalized. The
+// activity line reads it to say why the invoice exists (P-1, ADR-128); the
+// rows invoice.Service.Finalize writes never carry it.
 func finalizeAuditEntry(inv domain.Invoice) (audit.Entry, bool) {
 	if inv.Status != domain.InvoiceFinalized {
 		return audit.Entry{}, false
@@ -179,6 +184,7 @@ func finalizeAuditEntry(inv domain.Invoice) (audit.Entry, bool) {
 			"total_amount_cents": inv.TotalAmountCents,
 			"currency":           inv.Currency,
 			"triggered_by":       string(inv.BillingReason),
+			"born_finalized":     true,
 		},
 	}, true
 }
@@ -635,10 +641,10 @@ type InvoiceWriter interface {
 	// invoice visible with no record of what created it if the write failed).
 	CreateInvoiceWithLineItemsAudited(ctx context.Context, tenantID string, inv domain.Invoice, items []domain.InvoiceLineItem, emit func(tx *sql.Tx, out domain.Invoice) error) (domain.Invoice, error)
 	// CreateInvoiceWithLineItemsTx is the in-tx variant — used by BillOnCreateTx
-	// so the cross-interval plan-swap can insert the new-period invoice on the
-	// coordinator's tx, atomically with the plan write + watermark advance. The
-	// finalize audit row rides this same tx too (emitted by the caller right
-	// after the insert), so it commits atomically with the swap.
+	// and BillOnPlanSwapTx; the latter inserts the cross-interval swap's invoice
+	// on the coordinator's tx, atomically with the plan write + watermark
+	// advance. The finalize audit row rides this same tx too (emitted by the
+	// caller right after the insert), so it commits atomically with the swap.
 	CreateInvoiceWithLineItemsTx(ctx context.Context, tx *sql.Tx, tenantID string, inv domain.Invoice, items []domain.InvoiceLineItem) (domain.Invoice, error)
 	GetInvoice(ctx context.Context, tenantID, id string) (domain.Invoice, error)
 	// FindFundingInvoicesForPeriod returns EVERY non-voided/non-uncollectible
@@ -1110,13 +1116,78 @@ func mergeUsageIntervals(ivs []usageInterval) []usageInterval {
 	return out
 }
 
-// meterUsageIntervals builds, per meter, the windows a period close bills
-// usage over. Each item x segment contributes [seg.start, seg.end] to every
-// meter in its segment's plan, so a meter is billed only for the time a plan
+// usageFloors are the instants before which a subscription's usage window for
+// a meter may not start, beyond the window's own bounds (ADR-012 amendment
+// 2026-10-22). Periods start at midnight of the day they started (ADR-012),
+// and usage is aggregated per customer and meter with no subscription key, so
+// a window that opens at the period start can reach usage that is not this
+// subscription's:
+//
+//   - trialEnd: usage before the trial end is trial usage, which is free. The
+//     first paid period starts at midnight of the trial-end day.
+//   - coverageEnds: per meter, where another subscription of the customer
+//     stopped covering it (domain.MeterCoverageEnd). The guard against two
+//     live subscriptions on one meter (rejectMeterOverlap) means an end
+//     inside this window came before this subscription took the meter, and
+//     the usage up to it was that subscription's to bill.
+type usageFloors struct {
+	trialEnd     *time.Time
+	coverageEnds map[string][]time.Time
+}
+
+// start is where a usage window [s, e) for meter mid opens: at s, moved to
+// the trial end when that is later, then to the latest coverage end of
+// another subscription strictly inside the window. Strictly before e is what
+// keeps an earlier subscription's window whole: a later subscription's
+// coverage always ends after the earlier one's window does, so it never
+// moves it. The result can be at or past e, an empty window.
+func (f usageFloors) start(mid string, s, e time.Time) time.Time {
+	if f.trialEnd != nil && f.trialEnd.After(s) {
+		s = *f.trialEnd
+	}
+	for _, t := range f.coverageEnds[mid] {
+		if t.After(s) && t.Before(e) {
+			s = t
+		}
+	}
+	return s
+}
+
+// loadUsageFloors reads sub's usage floors for windows inside [from, to].
+// A read failure is returned: a window built without its floor bills usage
+// another subscription already billed, or trial usage.
+func (e *Engine) loadUsageFloors(ctx context.Context, sub domain.Subscription, from, to time.Time) (usageFloors, error) {
+	var f usageFloors
+	if sub.TrialEndAt != nil {
+		te := *sub.TrialEndAt
+		f.trialEnd = &te
+	}
+	ends, err := e.intervalSnap.ListCustomerMeterCoverageEnds(ctx, sub.TenantID, sub.CustomerID, sub.ID, from, to)
+	if err != nil {
+		return usageFloors{}, fmt.Errorf("usage window: other subscriptions' meter coverage: %w", err)
+	}
+	for _, end := range ends {
+		if f.coverageEnds == nil {
+			f.coverageEnds = make(map[string][]time.Time)
+		}
+		f.coverageEnds[end.MeterID] = append(f.coverageEnds[end.MeterID], end.EndsAt)
+	}
+	return f, nil
+}
+
+// meterUsageIntervals builds, per meter, the windows a closer bills usage
+// over. Each item x segment contributes [seg.start, seg.end] to every meter
+// in its segment's plan, so a meter is billed only for the time a plan
 // carrying it was on the subscription: a mid-period plan swap, item add or
 // item removal splits the period. segsByItem also holds items that left the
-// subscription during the window. The period close (buildLineItems) and the
-// live credit read (unbilledUsageCents) both call this.
+// subscription during the window. Every closer that bills a period's usage
+// by segment calls this: the period close (buildLineItems), the immediate
+// cancel and the cross-interval swap (buildCancelLineItems), the operator
+// preview (previewAsClose) and the live credit read (unbilledUsageCents).
+//
+// floors moves each window's start first (usageFloors.start), in both maps:
+// trial usage and another subscription's usage are nobody's here, whatever
+// the bucket.
 //
 // TWO maps (ADR-066 §4): clamped carries the watermark-CLAMPED windows that
 // additive (sum/count) buckets bill from; usage in
@@ -1127,10 +1198,11 @@ func mergeUsageIntervals(ivs []usageInterval) []usageInterval {
 // the residual window drops a pre-fire peak (partial-window mis-bill), and
 // splitting it double-bills. With no watermark full is empty and only
 // clamped is used. Intervals are not merged; callers run mergeUsageIntervals.
-func meterUsageIntervals(sub domain.Subscription, segsByItem map[string][]baseSegment, plans map[string]domain.Plan, periodStart, periodEnd time.Time, billedThrough *time.Time) (clamped, full map[string][]usageInterval) {
+func meterUsageIntervals(sub domain.Subscription, segsByItem map[string][]baseSegment, plans map[string]domain.Plan, periodStart, periodEnd time.Time, billedThrough *time.Time, floors usageFloors) (clamped, full map[string][]usageInterval) {
 	clamped = map[string][]usageInterval{}
 	full = map[string][]usageInterval{}
 	addMeterInterval := func(mid string, start, end time.Time) {
+		start = floors.start(mid, start, end)
 		if billedThrough != nil && end.After(start) {
 			full[mid] = append(full[mid], usageInterval{start, end})
 		}
@@ -2380,7 +2452,7 @@ func (e *Engine) applyDueScheduledPlanChanges(ctx context.Context, sub domain.Su
 	}
 	anyDue := false
 	for _, it := range sub.Items {
-		if it.PendingPlanID != "" && it.PendingPlanEffectiveAt != nil && !it.PendingPlanEffectiveAt.After(gate) {
+		if pendingPlanDue(it, gate) {
 			anyDue = true
 			break
 		}
@@ -2398,7 +2470,7 @@ func (e *Engine) applyDueScheduledPlanChanges(ctx context.Context, sub domain.Su
 		// snapshot map through this function.
 		dueItems := make([]domain.SubscriptionItem, 0)
 		for _, it := range sub.Items {
-			if it.PendingPlanID != "" && it.PendingPlanEffectiveAt != nil && !it.PendingPlanEffectiveAt.After(gate) {
+			if pendingPlanDue(it, gate) {
 				dueItems = append(dueItems, it)
 			}
 		}
@@ -2469,6 +2541,29 @@ func (e *Engine) applyDueScheduledPlanChanges(ctx context.Context, sub domain.Su
 		}
 	}
 	return sub, nil
+}
+
+// pendingPlanDue reports whether the item's scheduled plan change applies at
+// the close of the period ending at gate. ApplyDuePendingItemPlansAtomic
+// selects the same rows in SQL (pending_plan_effective_at <= gate).
+func pendingPlanDue(it domain.SubscriptionItem, gate time.Time) bool {
+	return it.PendingPlanID != "" && it.PendingPlanEffectiveAt != nil && !it.PendingPlanEffectiveAt.After(gate)
+}
+
+// withDuePlanChanges is sub with the plan changes due at gate applied in
+// memory: the items the close at gate bills, without the write.
+func withDuePlanChanges(sub domain.Subscription, gate time.Time) domain.Subscription {
+	items := make([]domain.SubscriptionItem, len(sub.Items))
+	for i, it := range sub.Items {
+		if pendingPlanDue(it, gate) {
+			it.PlanID = it.PendingPlanID
+			it.PendingPlanID = ""
+			it.PendingPlanEffectiveAt = nil
+		}
+		items[i] = it
+	}
+	sub.Items = items
+	return sub
 }
 
 // invoiceCurrency resolves an invoice's currency in the ADR-100 order:
@@ -2649,6 +2744,9 @@ func (e *Engine) handleTrialState(ctx context.Context, sub domain.Subscription, 
 					"customer_id":  sub.CustomerID,
 					"triggered_by": "schedule",
 				}
+				if sub.TrialEndAt != nil {
+					meta["trial_end_at"] = sub.TrialEndAt.UTC().Format(time.RFC3339)
+				}
 				_ = e.auditLogger.Log(ctx, sub.TenantID, domain.AuditActionUpdate, "subscription", sub.ID, sub.Code, meta)
 			}
 			// ADR-031 trial-end in_advance coverage now rides the
@@ -2681,8 +2779,8 @@ func nominalRate(rule domain.RatingRuleVersion) *decimal.Decimal {
 // buildLineItems computes the invoice line items and subtotal for one
 // billing period: per-item base-fee segments (change-log aware) plus
 // per-meter usage charges (multi-dimensional and single-rule paths),
-// honoring usage caps, thresholds already billed this cycle, and
-// scheduled-cancel terminal-cycle skips. Extracted whole from
+// honoring thresholds already billed this cycle and scheduled-cancel
+// terminal-cycle skips. Extracted whole from
 // billOnePeriod (behavior-preserving) to separate the pricing
 // computation from the billing-cycle orchestration; it remains large
 // and is the next candidate for further decomposition. Usage left
@@ -2790,28 +2888,20 @@ func (e *Engine) buildLineItems(ctx context.Context, sub domain.Subscription, no
 	// meter has exactly one full-period interval — output collapses
 	// to the pre-segment-aware single-line behavior. For subs where
 	// a mid-period plan change adds/removes meters, each meter
-	// bills only for the time it was actually on the sub. The usage
-	// cap scales every (meter, interval) quantity by one factor.
+	// bills only for the time it was actually on the sub.
 
 	// The windows each meter is billed over, from item segments and
-	// removed-item segments (meterUsageIntervals; shared with the live
-	// credit read so the two cannot drift).
-	meterIntervals, meterIntervalsFull := meterUsageIntervals(sub, segsByItem, plans, periodStart, periodEnd, thresholdBilledThrough)
-
-	// Usage is read once per window (one read covers every meter for a
-	// window; a pricing-rule meter reads its buckets per window). The block
-	// usage cap counts each meter over the windows it bills, before the
-	// threshold clamp, and every usage quantity below is scaled by it
-	// (usage_cap.go).
-	reads := newWindowUsage(e, sub, meterAggs)
-	capWindows := meterIntervals
-	if thresholdBilledThrough != nil {
-		capWindows = meterIntervalsFull
-	}
-	usageCap, err := e.usageCapFor(ctx, sub, capWindows, reads)
+	// removed-item segments (meterUsageIntervals; shared with every other
+	// closer and the live credit read so they cannot drift).
+	floors, err := e.loadUsageFloors(ctx, sub, periodStart, periodEnd)
 	if err != nil {
 		return nil, 0, nil, err
 	}
+	meterIntervals, meterIntervalsFull := meterUsageIntervals(sub, segsByItem, plans, periodStart, periodEnd, thresholdBilledThrough, floors)
+
+	// Usage is read once per window (one read covers every meter for a
+	// window; a pricing-rule meter reads its buckets per window).
+	reads := newWindowUsage(e, sub, meterAggs)
 
 	// Union of meters with billable windows. When a watermark exists, a
 	// meter whose clamped intervals vanished entirely (all usage inside the
@@ -2835,7 +2925,7 @@ func (e *Engine) buildLineItems(ctx context.Context, sub domain.Subscription, no
 	}
 	// One tier ladder per usage bucket for the whole close, continuing from
 	// what a threshold fire already billed (P21, ADR-066 amendment).
-	ladder := newUsageLadder(wm, usageCap.binds())
+	ladder := newUsageLadder(wm)
 	for meterID := range meterIDSet {
 		meter, err := e.pricing.GetMeter(ctx, sub.TenantID, meterID)
 		if err != nil {
@@ -2849,7 +2939,7 @@ func (e *Engine) buildLineItems(ctx context.Context, sub domain.Subscription, no
 		// the threshold scan use — a single meter-linked rating rule can't
 		// express N rates, so the legacy single-rule branch below would skip
 		// the meter and emit a $0 invoice (the wedge breakage, ADR-044).
-		// previewMeter is the mirror of this loop: same path → preview ==
+		// rateMeterWindow is the mirror of this loop: same path → preview ==
 		// invoice. Meters with no pricing rules keep the single-rule path.
 		pricingRules, err := e.pricing.ListMeterPricingRulesByMeter(ctx, sub.TenantID, meterID)
 		if err != nil {
@@ -2884,9 +2974,7 @@ func (e *Engine) buildLineItems(ctx context.Context, sub domain.Subscription, no
 					return nil, 0, nil, err
 				}
 				for _, agg := range aggs {
-					// The cap's one factor. A bucket below zero bills 0, so
-					// the cap leaves it at its own value.
-					qty := usageCap.apply(agg.Quantity)
+					qty := agg.Quantity
 					if qty.IsZero() {
 						continue
 					}
@@ -2974,9 +3062,6 @@ func (e *Engine) buildLineItems(ctx context.Context, sub domain.Subscription, no
 			if err != nil {
 				return nil, 0, nil, err
 			}
-			// The cap's one factor, for a full-period and a sub-period
-			// quantity alike; not for a quantity below zero (it bills 0).
-			quantity = usageCap.apply(quantity)
 			if quantity.IsZero() {
 				continue
 			}
@@ -3466,7 +3551,7 @@ func (e *Engine) BillOnCreate(ctx context.Context, sub domain.Subscription) (dom
 	)
 	defer span.End()
 
-	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, sub, e.effectiveNow(ctx, sub))
+	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, sub, e.effectiveNow(ctx, sub), nil)
 	if err != nil {
 		return domain.Invoice{}, err
 	}
@@ -3523,15 +3608,15 @@ func (e *Engine) nextInvoiceNumber(ctx context.Context, tx *sql.Tx, tenantID str
 // inserts the day-1 in_advance invoice on the caller's tx but does NOT finalize
 // (audit / tax-commit / auto-charge are external and must run after the tx
 // commits). The caller commits, then calls FinalizeOnCreateInvoice post-commit.
-// Used by the atomic cross-interval plan-swap so the new-period invoice commits
-// atomically with the plan write + watermark advance — a failed bill rolls the
-// whole swap back rather than silently dropping the new in_advance period.
+// Used by create, activate and the trial flip, so the day-1 invoice commits
+// atomically with the subscription write. (The cross-interval plan swap uses
+// BillOnPlanSwapTx, which also bills the old period's usage.)
 // Returns ok=false (nil error) for the no-op cases (no in_advance items / zero
 // subtotal) and for an idempotent-skip on the period-uniqueness constraint.
 //
 // startAt is the instant the billed period began for this subscription: the
-// trial end on a trial flip, the request's now on create, activate, early
-// trial end and plan swap. The pause is read as it stood then, because a trial
+// trial end on a trial flip, the request's now on create, activate and early
+// trial end (and the swap instant for BillOnPlanSwapTx). The pause is read as it stood then, because a trial
 // flip can run after resumes_at for a period that began while still paused.
 func (e *Engine) BillOnCreateTx(ctx context.Context, tx *sql.Tx, sub domain.Subscription, startAt time.Time) (domain.Invoice, bool, error) {
 	ctx, span := telemetry.Tracer("billing").Start(ctx, "billing.BillOnCreateTx",
@@ -3542,7 +3627,7 @@ func (e *Engine) BillOnCreateTx(ctx context.Context, tx *sql.Tx, sub domain.Subs
 	)
 	defer span.End()
 
-	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, sub, startAt)
+	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, sub, startAt, nil)
 	if err != nil {
 		return domain.Invoice{}, false, err
 	}
@@ -3578,15 +3663,124 @@ func (e *Engine) BillOnCreateTx(ctx context.Context, tx *sql.Tx, sub domain.Subs
 	return created, true, nil
 }
 
+// BillOnPlanSwapTx writes, on the swap's tx, the invoice of an immediate
+// in_advance cross-interval plan swap (ADR-056). The swap moves the period
+// from [old start, old end) to [at, new end), so it is the closer of the old
+// window [old start, at): nothing else bills that window's usage later. The
+// invoice has the renewal shape (ADR-031): the new period's base, plus the old
+// window's usage priced as an immediate cancel prices its partial window
+// (buildCancelLineItems: from the threshold watermark, segment-aware, in_advance
+// base skipped). One invoice, one charge.
+//
+// before is the pre-swap snapshot the caller proved under the subscription
+// row lock (the period CAS and the item check); after is the prospective
+// subscription on the new plan and period. The threshold watermark is read on
+// tx, after that lock, so a reset=false fire that committed before the lock is
+// seen and its window is not billed again; a later fire fails its own CAS.
+//
+// ok=false (nil error) when there is nothing to bill. afterCommit is never
+// nil; the caller runs it once tx commits (it counts the usage left unpriced,
+// which a rolled-back, retried swap must not count twice).
+func (e *Engine) BillOnPlanSwapTx(ctx context.Context, tx *sql.Tx, before, after domain.Subscription, at time.Time) (domain.Invoice, bool, func(), error) {
+	ctx, span := telemetry.Tracer("billing").Start(ctx, "billing.BillOnPlanSwapTx",
+		trace.WithAttributes(
+			attribute.String("subscription_id", before.ID),
+			attribute.String("tenant_id", before.TenantID),
+		),
+	)
+	defer span.End()
+
+	unpriced := unpricedUsage{}
+	afterCommit := func() { unpriced.record(ctx, before) }
+	if before.CurrentBillingPeriodStart == nil || before.CurrentBillingPeriodEnd == nil {
+		return domain.Invoice{}, false, afterCommit, fmt.Errorf("subscription has no billing period set")
+	}
+	ps, pe := *before.CurrentBillingPeriodStart, *before.CurrentBillingPeriodEnd
+
+	belowZero := netNegativeUsage{}
+	var carry []domain.InvoiceLineItem
+	if at.After(ps) {
+		wm, err := e.loadThresholdWatermarkTx(ctx, tx, before.TenantID, before.ID, ps, pe)
+		if err != nil {
+			return domain.Invoice{}, false, afterCommit, err
+		}
+		plans := make(map[string]domain.Plan, len(before.Items))
+		for _, it := range before.Items {
+			if _, ok := plans[it.PlanID]; ok {
+				continue
+			}
+			pl, err := e.pricing.GetPlan(ctx, before.TenantID, it.PlanID)
+			if err != nil {
+				return domain.Invoice{}, false, afterCommit, fmt.Errorf("get plan %s: %w", it.PlanID, err)
+			}
+			plans[it.PlanID] = pl
+		}
+		if len(before.Items) > 0 {
+			// Same currency order as the cancel; the swap refuses a currency
+			// change (ADR-100), so it is the new invoice's currency too.
+			cur, err := e.invoiceCurrency(ctx, before, plans[before.Items[0].PlanID].Currency)
+			if err != nil {
+				return domain.Invoice{}, false, afterCommit, err
+			}
+			loc, err := e.tenantLocation(ctx, before.TenantID)
+			if err != nil {
+				return domain.Invoice{}, false, afterCommit, err
+			}
+			carry, _, err = e.buildCancelLineItems(ctx, before, wm, plans, cur, ps, at, loc, unpriced, belowZero, swapUsageSuffix)
+			if err != nil {
+				return domain.Invoice{}, false, afterCommit, fmt.Errorf("plan swap: old period usage: %w", err)
+			}
+		}
+	}
+	noteBelowZero := func(inv domain.Invoice) error {
+		return e.noteNetNegativeTx(ctx, tx, before, belowZero, domain.BillingReasonSubscriptionCreate, ps, at, inv)
+	}
+
+	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, after, at, carry)
+	if err != nil {
+		return domain.Invoice{}, false, afterCommit, err
+	}
+	if !ok {
+		if err := noteBelowZero(domain.Invoice{}); err != nil {
+			return domain.Invoice{}, false, afterCommit, fmt.Errorf("usage below zero row (swap tx): %w", err)
+		}
+		return domain.Invoice{}, false, afterCommit, nil
+	}
+	invoiceNumber, err := e.nextInvoiceNumber(ctx, tx, after.TenantID)
+	if err != nil {
+		return domain.Invoice{}, false, afterCommit, fmt.Errorf("mint invoice number: %w", err)
+	}
+	inv.InvoiceNumber = invoiceNumber
+	// No idempotent skip: a unique violation poisons the caller's tx (see
+	// BillOnCreateTx), so it fails the swap loud.
+	created, err := e.invoices.CreateInvoiceWithLineItemsTx(ctx, tx, after.TenantID, inv, lineItems)
+	if err != nil {
+		return domain.Invoice{}, false, afterCommit, fmt.Errorf("create plan-swap invoice (tx): %w", err)
+	}
+	if err := e.emitFinalizeAuditTx(ctx, tx, created); err != nil {
+		return domain.Invoice{}, false, afterCommit, fmt.Errorf("finalize audit (swap tx): %w", err)
+	}
+	if err := noteBelowZero(created); err != nil {
+		return domain.Invoice{}, false, afterCommit, fmt.Errorf("usage below zero row (swap tx): %w", err)
+	}
+	return created, true, afterCommit, nil
+}
+
 // buildOnCreateInvoice computes the day-1 in_advance invoice for sub: resolves
 // plans, filters to in_advance items, builds prorated base-fee lines, and
 // applies tax. It performs NO DB writes and mints NO invoice number — the
 // caller persists (BillOnCreate via the store's own tx, BillOnCreateTx on a
 // coordinator tx) and finalizes. Returns ok=false (nil error) for the no-op
 // cases: inactive sub, no in_advance items, or zero subtotal. The returned
-// invoice has no InvoiceNumber and carries CreatedAt == effective-now.
-// startAt is the instant the pause is read at (see BillOnCreateTx).
-func (e *Engine) buildOnCreateInvoice(ctx context.Context, sub domain.Subscription, startAt time.Time) (domain.Invoice, []domain.InvoiceLineItem, bool, error) {
+// invoice has no InvoiceNumber and carries IssuedAt == CreatedAt == startAt,
+// the instant the billed period began (see BillOnCreateTx); the pause is read
+// as it stood then, and DueAt counts the net terms from it.
+//
+// carry is lines another window owes that this invoice bills beside the base:
+// the old period's usage on a plan swap (BillOnPlanSwapTx). They count toward
+// the zero-subtotal check and are taxed with the base. nil for a plain day-1
+// invoice.
+func (e *Engine) buildOnCreateInvoice(ctx context.Context, sub domain.Subscription, startAt time.Time, carry []domain.InvoiceLineItem) (domain.Invoice, []domain.InvoiceLineItem, bool, error) {
 	if sub.Status != domain.SubscriptionActive {
 		return domain.Invoice{}, nil, false, nil
 	}
@@ -3594,7 +3788,13 @@ func (e *Engine) buildOnCreateInvoice(ctx context.Context, sub domain.Subscripti
 		return domain.Invoice{}, nil, false, fmt.Errorf("subscription has no billing period set")
 	}
 
-	now := e.effectiveNow(ctx, sub)
+	// The invoice is issued when its period began. Every caller passes that
+	// instant: effective-now for create, activate, early trial end and the
+	// plan swap; trial_end_at for the trial-expiry scans; the cycle close for
+	// the engine's own trial flip. Reading the clock here instead dated a
+	// day-1 invoice swept by a long advance at the advance's target, after
+	// the cycle invoices it preceded (B12, P-3).
+	now := startAt
 	periodStart := *sub.CurrentBillingPeriodStart
 	periodEnd := *sub.CurrentBillingPeriodEnd
 
@@ -3647,11 +3847,15 @@ func (e *Engine) buildOnCreateInvoice(ctx context.Context, sub domain.Subscripti
 		return domain.Invoice{}, nil, false, err
 	}
 	baseLines := onCreateBaseLines(sub, plans, advanceItems, periodStart, periodEnd, invoiceCurrency, billingLoc)
-	lineItems := make([]domain.InvoiceLineItem, 0, len(baseLines))
+	lineItems := make([]domain.InvoiceLineItem, 0, len(baseLines)+len(carry))
 	subtotal := int64(0)
 	for _, bl := range baseLines {
 		lineItems = append(lineItems, bl.line)
 		subtotal += bl.line.AmountCents
+	}
+	for _, li := range carry {
+		lineItems = append(lineItems, li)
+		subtotal += li.AmountCents
 	}
 
 	if subtotal <= 0 {
@@ -3755,8 +3959,9 @@ func onCreateBaseLines(sub domain.Subscription, plans map[string]domain.Plan, ad
 func (e *Engine) FinalizeOnCreateInvoice(ctx context.Context, sub domain.Subscription, inv domain.Invoice) {
 	// The finalize AUDIT row rode the invoice-create tx (ADR-090 shared fate):
 	// the own-tx callers (BillOnCreate) emit it via finalizeAuditEmit, and the
-	// coordinator-tx caller (the cross-interval swap through BillOnCreateTx) emits
-	// it on the coordinator tx. So this post-commit path fires only the external,
+	// coordinator-tx callers (BillOnCreateTx, the cross-interval swap through
+	// BillOnPlanSwapTx, the cancel through BillFinalOnImmediateCancelTx) emit it
+	// on the coordinator tx. So this post-commit path fires only the external,
 	// best-effort effects — WEBHOOK, tax commit, auto-charge — none of which may
 	// ride a DB tx.
 	e.dispatchInvoiceFinalized(ctx, sub, inv)
@@ -3849,7 +4054,7 @@ func (e *Engine) BillFinalOnImmediateCancelTx(ctx context.Context, tx *sql.Tx, s
 // the period open, then patch the customer's override in force at the
 // same instant on top. One period, one price — cycle close, cancel
 // finalize, threshold fire, and preview all call this (preview via its
-// mirror in previewMeter), so they agree by construction and a
+// mirror in rateMeterWindow), so they agree by construction and a
 // mid-close publish or override edit can't mix prices inside one
 // invoice.
 //
@@ -3885,18 +4090,27 @@ func (e *Engine) resolveRatedRule(ctx context.Context, tenantID, customerID, pin
 	return domain.RatingRuleVersion{}, fmt.Errorf("resolve override for rule %q: %w", rule.RuleKey, err)
 }
 
+// The usage-line suffixes of a partial window: an immediate cancel ended it,
+// or a cross-interval plan swap did (BillOnPlanSwapTx).
+const (
+	cancelUsageSuffix = " - canceled mid-period"
+	swapUsageSuffix   = " - before plan change"
+)
+
 // buildCancelLineItems computes the final invoice's line items and
 // subtotal for an immediate mid-period cancel: segment-aware in_arrears
 // base fees over the partial period [periodStart, canceledAt] (skipped
 // entirely when a threshold fire already billed the unprorated base)
-// plus segment-aware usage, honoring the usage cap and the threshold
-// watermark's clamped/full dual-window protocol. Extracted whole from
+// plus segment-aware usage, honoring the threshold watermark's
+// clamped/full dual-window protocol. Extracted whole from
 // billFinalOnImmediateCancelImpl (behavior-preserving) to separate the
 // pricing computation from the cancel-invoice orchestration; it is the
 // cancel-path analog of buildLineItems and shares its segment model.
 // Usage left unpriced is added to unpriced, and usage below zero to
-// belowZero, as in buildLineItems.
-func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscription, wm thresholdWatermark, plans map[string]domain.Plan, invoiceCurrency string, periodStart, canceledAt time.Time, billingLoc *time.Location, unpriced unpricedUsage, belowZero netNegativeUsage) ([]domain.InvoiceLineItem, int64, error) {
+// belowZero, as in buildLineItems. usageSuffix ends each usage line's
+// description and says why the window ended early: cancelUsageSuffix or
+// swapUsageSuffix.
+func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscription, wm thresholdWatermark, plans map[string]domain.Plan, invoiceCurrency string, periodStart, canceledAt time.Time, billingLoc *time.Location, unpriced unpricedUsage, belowZero netNegativeUsage, usageSuffix string) ([]domain.InvoiceLineItem, int64, error) {
 	// Build base lines: segment-aware in_arrears billing over the
 	// partial period [periodStart, canceledAt]. in_advance items are
 	// explicitly skipped — their base for the just-canceled period
@@ -4001,72 +4215,18 @@ func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscripti
 	}
 
 	// Segment-aware usage billing over the partial period
-	// [periodStart, canceledAt]. Mirrors the billOnePeriod shape:
-	// each meter bills only for the time it was active on the sub —
-	// including the dual clamped/full interval maps for the threshold
-	// watermark protocol (ADR-066 §4; see billOnePeriod for the full
-	// rationale).
-	meterIntervals := map[string][]usageInterval{}
-	meterIntervalsFull := map[string][]usageInterval{}
-	addMeterInterval := func(mid string, start, end time.Time) {
-		if wm.exists() && end.After(start) {
-			meterIntervalsFull[mid] = append(meterIntervalsFull[mid], usageInterval{start, end})
-		}
-		if wm.billedThrough != nil && start.Before(*wm.billedThrough) {
-			start = *wm.billedThrough
-		}
-		if !end.After(start) {
-			return
-		}
-		meterIntervals[mid] = append(meterIntervals[mid], usageInterval{start, end})
-	}
-	for _, it := range sub.Items {
-		segments := segsByItem[it.ID]
-		if len(segments) == 0 {
-			for _, mid := range plans[it.PlanID].MeterIDs {
-				addMeterInterval(mid, periodStart, canceledAt)
-			}
-			continue
-		}
-		for _, seg := range segments {
-			segPlan, ok := plans[seg.planID]
-			if !ok {
-				continue
-			}
-			for _, mid := range segPlan.MeterIDs {
-				addMeterInterval(mid, seg.start, seg.end)
-			}
-		}
-	}
-	for itemID, segments := range segsByItem {
-		if _, stillPresent := itemsByID[itemID]; stillPresent {
-			continue
-		}
-		for _, seg := range segments {
-			segPlan, ok := plans[seg.planID]
-			if !ok {
-				continue
-			}
-			for _, mid := range segPlan.MeterIDs {
-				addMeterInterval(mid, seg.start, seg.end)
-			}
-		}
-	}
-
-	// The block usage cap, worked out as the period close works it out
-	// (usage_cap.go): the partial window [periodStart, canceledAt] is the
-	// entire billable extent of the final cycle, so the per-cycle cap
-	// applies to it whole, each meter over the windows it bills. The cap
-	// and the lines read usage through reads, once per window.
-	reads := newWindowUsage(e, sub, meterAggs)
-	capWindows := meterIntervals
-	if wm.exists() {
-		capWindows = meterIntervalsFull
-	}
-	usageCap, err := e.usageCapFor(ctx, sub, capWindows, reads)
+	// [periodStart, canceledAt]: the period close's own window builder
+	// (meterUsageIntervals), ended at the cancel instant, with the dual
+	// clamped/full maps of the threshold watermark protocol (ADR-066 §4) and
+	// the usage floors.
+	floors, err := e.loadUsageFloors(ctx, sub, periodStart, canceledAt)
 	if err != nil {
-		return nil, 0, fmt.Errorf("cancel: %w", err)
+		return nil, 0, err
 	}
+	meterIntervals, meterIntervalsFull := meterUsageIntervals(sub, segsByItem, plans, periodStart, canceledAt, wm.billedThrough, floors)
+
+	// The lines read usage through reads, once per window.
+	reads := newWindowUsage(e, sub, meterAggs)
 
 	// Union of meters with billable windows (a meter fully clamped away can
 	// still owe a full-window bill for a deferred non-additive bucket) +
@@ -4083,7 +4243,7 @@ func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscripti
 		nonAdditiveOnly bool
 	}
 	// Same per-bucket tier ladder as the cycle close (P21, ADR-066 amendment).
-	ladder := newUsageLadder(wm, usageCap.binds())
+	ladder := newUsageLadder(wm)
 	for meterID := range cancelMeterIDSet {
 		// Does this meter price via dimension-match pricing rules (the
 		// multi-dim shape: e.g. the AI `tokens` meter, one rule per
@@ -4131,9 +4291,7 @@ func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscripti
 					return nil, 0, fmt.Errorf("cancel: %w", err)
 				}
 				for _, agg := range aggs {
-					// The cap's one factor, as in billOnePeriod's multi-dim
-					// branch (not for a bucket below zero, which bills 0).
-					qty := usageCap.apply(agg.Quantity)
+					qty := agg.Quantity
 					if qty.IsZero() {
 						continue
 					}
@@ -4179,7 +4337,7 @@ func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscripti
 						LineType:                 domain.LineTypeUsage,
 						MeterID:                  meterID,
 						MeterUnit:                meter.Unit,
-						Description:              usageLineDescription(meter, rulesByID[agg.RuleID]) + " - canceled mid-period",
+						Description:              usageLineDescription(meter, rulesByID[agg.RuleID]) + usageSuffix,
 						Quantity:                 qty.IntPart(),
 						QuantityDecimal:          qty,
 						UnitAmountCents:          unitAmount,
@@ -4213,9 +4371,6 @@ func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscripti
 			if err != nil {
 				return nil, 0, fmt.Errorf("cancel: %w", err)
 			}
-			// The cap's one factor, for the whole window and a segment
-			// alike; not for a quantity below zero, which bills 0.
-			quantity = usageCap.apply(quantity)
 			if quantity.IsZero() {
 				continue
 			}
@@ -4250,7 +4405,7 @@ func (e *Engine) buildCancelLineItems(ctx context.Context, sub domain.Subscripti
 				LineType:                 domain.LineTypeUsage,
 				MeterID:                  meterID,
 				MeterUnit:                meter.Unit,
-				Description:              fmt.Sprintf("%s (%s) - canceled mid-period", meter.Name, meter.Unit),
+				Description:              fmt.Sprintf("%s (%s)", meter.Name, meter.Unit) + usageSuffix,
 				Quantity:                 quantity.IntPart(),
 				QuantityDecimal:          quantity,
 				UnitAmountCents:          unitAmount,
@@ -4301,8 +4456,10 @@ func (e *Engine) billFinalOnImmediateCancelImpl(ctx context.Context, tx *sql.Tx,
 	// of 'trialing' (activated_at never stamped) emits NO final invoice —
 	// trials are free. The reachable window is the post-trial LAG: the trial
 	// elapsed but the activation scan hadn't flipped the row yet, so
-	// canceled_at lands at or after trial_end = period_start and this
-	// function would otherwise bill prorated base + usage for a
+	// canceled_at lands at or after trial_end, which is after period_start
+	// (the first paid period starts at midnight of the trial-end day,
+	// firstPeriodAfterTrial), and this function would otherwise bill
+	// prorated base + usage for a
 	// never-activated sub. Decided: write off — matches the trial-end
 	// scheduled-cancel semantics ("you won't be charged") rather than
 	// billing on scan lag the customer can't see. Subs created active carry
@@ -4391,7 +4548,7 @@ func (e *Engine) billFinalOnImmediateCancelImpl(ctx context.Context, tx *sql.Tx,
 	// tx, the caller's transaction can still roll back, so it is left in
 	// unpriced for the caller to count after its commit.
 	belowZero := netNegativeUsage{}
-	lineItems, subtotal, err := e.buildCancelLineItems(ctx, sub, wm, plans, invoiceCurrency, periodStart, canceledAt, billingLoc, unpriced, belowZero)
+	lineItems, subtotal, err := e.buildCancelLineItems(ctx, sub, wm, plans, invoiceCurrency, periodStart, canceledAt, billingLoc, unpriced, belowZero, cancelUsageSuffix)
 	if err != nil {
 		return domain.Invoice{}, err
 	}
@@ -4469,7 +4626,7 @@ func (e *Engine) billFinalOnImmediateCancelImpl(ctx context.Context, tx *sql.Tx,
 		// Atomic path (CancelAtomicWithBill): insert on the caller's coordinator
 		// tx. No idempotent-skip — a unique violation poisons the caller's tx, so
 		// surface it and let the cancel roll back (same contract as the swap
-		// path's BillOnCreateTx). The external finalize (webhook + tax commit +
+		// path's BillOnPlanSwapTx). The external finalize (webhook + tax commit +
 		// auto-charge) runs post-commit via FinalizeOnCreateInvoice; the AUDIT row
 		// rides THIS coordinator tx so it commits atomically with the cancel.
 		created, err := e.invoices.CreateInvoiceWithLineItemsTx(ctx, tx, sub.TenantID, invToCreate, lineItems)
@@ -4789,57 +4946,59 @@ func (e *Engine) reliefTx(ctx context.Context, tx *sql.Tx, sub domain.Subscripti
 			totalUnused = max(0, totalUnused-src.SubtotalCents)
 			continue
 		}
-		// A partly-used draft whose tax is not settled has no final total to
-		// size its credit note against: refuse, so the change is retried once
-		// the tax retry resolves it (normally minutes) rather than relieving a
-		// wrong amount.
-		if src.Status == domain.InvoiceDraft && src.TaxStatus != domain.InvoiceTaxOK && src.TaxStatus != "" {
-			return domain.Relief{}, errs.InvalidState(fmt.Sprintf(
-				"%s: funding invoice %s is a draft whose tax is still %s; retry once it is calculated", what, src.ID, src.TaxStatus)).
-				WithCode("funding_invoice_tax_pending")
-		}
 		allocate = append(allocate, src)
 	}
 	if len(allocate) == 0 || totalUnused <= 0 {
 		return r, nil
 	}
 
-	// What does not fit in the funding invoices' remaining room is logged by
-	// the allocator, and the shares carry what fits. A set already fully
-	// credited gets no shares, so the change proceeds with no relief.
-	shares, err := e.allocateUnusedAcrossFunding(ctx, sub, allocate, in.PeriodEnd, in.CancelAt, totalUnused)
-	if err != nil {
-		return domain.Relief{}, fmt.Errorf("%s: allocate across funding invoices: %w", what, err)
+	// One crediting rule (ADR-118, amended 2026-10-22): the newest charging
+	// invoice first, each capped at its room. The headroom read MUST stay off
+	// this tx: it counts drafts, so an on-tx read would let this change's own
+	// drafts shrink their room. CreateAdjustmentDraftTx re-checks the cap
+	// under the invoice lock.
+	credited := make(map[string]int64, len(allocate))
+	for _, src := range allocate {
+		c, cerr := e.creditHeadroom.CreditedCents(ctx, sub.TenantID, src.ID)
+		if cerr != nil {
+			return domain.Relief{}, fmt.Errorf("%s: read creditable headroom for %s: %w", what, src.ID, cerr)
+		}
+		credited[src.ID] = c
+	}
+	shares, unplaced := domain.AllocateUnusedCredit(allocate, credited, "", totalUnused)
+	// What did not fit is not owed (every invoice is credited up to its total,
+	// or relieved of all it asks for); the change records it.
+	r.UncreditedCents = unplaced
+	// A draft whose tax is not settled has no final total to size its note
+	// against: refuse, so the change is retried once the tax retry resolves it
+	// (normally minutes) rather than relieving a wrong amount.
+	if src, pending := domain.TaxPendingShare(allocate, shares); pending {
+		return domain.Relief{}, errs.InvalidState(fmt.Sprintf(
+			"%s: funding invoice %s is a draft whose tax is still %s; retry once it is calculated", what, src.ID, src.TaxStatus)).
+			WithCode("funding_invoice_tax_pending")
 	}
 
 	shareIDs := make([]string, 0, len(shares))
 	for _, sh := range shares {
-		shareIDs = append(shareIDs, sh.Source.ID)
+		shareIDs = append(shareIDs, sh.InvoiceID)
 	}
 	if err := e.creditNoteAdjuster.LockInvoicesForDraftsTx(ctx, tx, sub.TenantID, shareIDs); err != nil {
 		return domain.Relief{}, fmt.Errorf("%s: lock funding invoices: %w", what, err)
 	}
 	for _, sh := range shares {
-		src := sh.Source
-		gross := sh.GrossCents
-		if src.PaymentStatus != domain.PaymentSucceeded {
-			gross = unpaidRelief(src, sh.NetCents)
-		}
-		if gross <= 0 {
-			continue
-		}
 		// A credit-note cap rejection here (a concurrent operator credit note
 		// shrank the source's headroom after the off-tx CreditedCents read)
 		// rolls the change back too; the retry re-reads the smaller headroom.
-		// A draft source gets its note too: Issue holds it until the invoice
-		// is finalized (and voids it if the draft is voided instead).
-		cn, cerr := e.creditNoteAdjuster.CreateAdjustmentDraftTx(ctx, tx, sub.TenantID, src.ID, gross, reason, in.Desc)
+		// A draft or in-flight source gets its note too: Issue holds it until
+		// the invoice is finalized or the charge settles (and voids it if the
+		// source is voided instead).
+		cn, cerr := e.creditNoteAdjuster.CreateAdjustmentDraftTx(ctx, tx, sub.TenantID, sh.InvoiceID, sh.GrossCents, reason, in.Desc)
 		if cerr != nil {
-			return domain.Relief{}, fmt.Errorf("%s: credit-note draft on %s: %w", what, src.ID, cerr)
+			return domain.Relief{}, fmt.Errorf("%s: credit-note draft on %s: %w", what, sh.InvoiceID, cerr)
 		}
 		r.DraftIDs = append(r.DraftIDs, cn.ID)
-		if src.PaymentStatus == domain.PaymentSucceeded {
-			r.CreditedCents += gross
+		if sh.ToBalance {
+			r.CreditedCents += sh.GrossCents
 		}
 	}
 	return r, nil
@@ -4878,24 +5037,6 @@ func (e *Engine) onlyPrepaidBase(ctx context.Context, tenantID string, src domai
 	return len(lines) > 0, nil
 }
 
-// unpaidRelief sizes the relief for an UNPAID, partly-used funding invoice's
-// share (net, tax-exclusive): grossed up by the invoice's own Total/Subtotal
-// ratio so the unused portion's tax is relieved too (Velox invoices carry one
-// tax rate and no discount, so the ratio is 1 + rate), clamped to what the
-// invoice can still be relieved of: its amount_due plus the customer credits
-// applied to it. An adjustment credit note reduces amount_due first and returns
-// the credits the rest displaces to the balance (ADR-061); on an in-flight
-// source Issue() defers the note until the charge settles (ADR-059). (A
-// fully-unused unpaid source that is only prepaid base is voided before
-// allocation.)
-func unpaidRelief(src domain.Invoice, net int64) int64 {
-	gross := net
-	if src.SubtotalCents > 0 {
-		gross = money.RoundHalfToEven(net*src.TotalAmountCents, src.SubtotalCents)
-	}
-	return min(gross, src.UnpaidRelievableCents())
-}
-
 // FinishRelief runs a committed Relief's post-commit legs: issue the
 // credit-note drafts (Stripe tax reversal + customer-balance grant, or the
 // amount_due reduction) and the voids' tax reversal and webhook. Best-effort:
@@ -4916,159 +5057,6 @@ func (e *Engine) FinishRelief(ctx context.Context, sub domain.Subscription, r do
 	for _, inv := range r.Voided {
 		e.invoiceVoider.AfterVoid(ctx, sub.TenantID, inv)
 	}
-}
-
-// fundingShare is one funding invoice's allocated slice of the unused-prebill
-// credit, from allocateUnusedAcrossFunding. totalUnused (net, sized off the
-// post-change base across all items) is PARTITIONED across the funding invoices
-// in proportion to each invoice's own unused contribution, so the customer is
-// neither over- nor under-credited after a prior reversing change. GrossCents is
-// the clamped credit-note gross for a PAID source (the customer-balance credit);
-// an UNPAID source carries only NetCents (unpaidRelief computes its gross).
-type fundingShare struct {
-	Source     domain.Invoice
-	NetCents   int64
-	GrossCents int64
-}
-
-// allocateUnusedAcrossFunding is the PURE allocation half: weight each funding
-// invoice by its own unused net contribution, cap each at its remaining headroom
-// (PAID: creditable = total − already-credited; UNPAID: amount_due), water-fill
-// via AllocateByWeightCapped, and return the shares that fit. A remainder that
-// fits nowhere is logged, as ERROR for an all-paid set and WARN for a mixed one,
-// and never placed. READS + MATH only — no Create/Issue — so it is safe inside a
-// coordinator tx. CRITICAL: the per-source caps and the net→gross clamp live
-// HERE, so the #276/#277/#278 over-credit invariant (cumulative credit ≤ funding
-// headroom) holds for every relief write. The CreditedCents
-// headroom read MUST stay off any coordinator tx — it counts non-voided notes
-// INCLUDING drafts, so an on-tx read would let an in-flight draft shrink its own
-// headroom.
-func (e *Engine) allocateUnusedAcrossFunding(ctx context.Context, sub domain.Subscription, sources []domain.Invoice, periodEnd, effectiveAt time.Time, totalUnused int64) ([]fundingShare, error) {
-	unusedDays := roundDays(periodEnd.Sub(effectiveAt))
-	if unusedDays <= 0 {
-		return nil, nil
-	}
-	weights := make([]int64, len(sources))
-	grossCaps := make([]int64, len(sources))
-	netCaps := make([]int64, len(sources))
-	hasUnpaid := false
-	for i, src := range sources {
-		windowDays := roundDays(periodEnd.Sub(src.BillingPeriodStart))
-		if windowDays > 0 && src.SubtotalCents > 0 {
-			// This invoice's own unused net contribution = what it prepaid times
-			// the unused fraction of the window it covers. Clamp the unused span
-			// to the window so a source whose window starts after the effective
-			// instant isn't over-weighted.
-			ud := unusedDays
-			if ud > windowDays {
-				ud = windowDays
-			}
-			weights[i] = money.RoundHalfToEven(src.SubtotalCents*int64(ud), int64(windowDays))
-		}
-		// Per-source headroom cap, so the allocator water-fills any overflow onto
-		// sources that still have room rather than over-assigning one:
-		//   - PAID + real total → remaining creditable (total minus prior
-		//     non-voided credit notes via the optional reader; full total
-		//     unwired). A prior credit note that shrank it pushes the share
-		//     elsewhere.
-		//   - UNPAID + real total → amount_due plus the customer credits applied
-		//     to it. unpaidRelief can relieve a receivable down to zero and
-		//     hand its applied credits back, no further, so capping here makes
-		//     the allocator route the un-relievable overflow to PAID sources
-		//     (which credit the customer) instead of silently dropping it inside
-		//     the relieve clamp (2026-06-15 mixed paid/unpaid fix).
-		//   - zero-total source (drift state; a $0 invoice funds nothing) →
-		//     no meaningful cap; gross clamps to 0 downstream, so the share
-		//     is skipped rather than credited beyond real money in.
-		switch {
-		case src.PaymentStatus == domain.PaymentSucceeded && src.TotalAmountCents > 0:
-			// creditHeadroom is REQUIRED (boot fails closed, #442) — the old
-			// nil arm used the FULL invoice total as the cap, silently
-			// disabling the #276-#278 overcharge guard (a source already
-			// partially credited by a prior CN could be over-credited).
-			credited, err := e.creditHeadroom.CreditedCents(ctx, sub.TenantID, src.ID)
-			if err != nil {
-				return nil, fmt.Errorf("read creditable headroom for %s: %w", src.ID, err)
-			}
-			grossCap := src.TotalAmountCents - credited
-			if grossCap < 0 {
-				grossCap = 0
-			}
-			grossCaps[i] = grossCap
-			netCap := grossCap
-			if src.SubtotalCents > 0 {
-				netCap = money.RoundHalfToEven(grossCap*src.SubtotalCents, src.TotalAmountCents)
-			}
-			netCaps[i] = netCap
-		case src.TotalAmountCents > 0:
-			hasUnpaid = true
-			grossCap := src.UnpaidRelievableCents()
-			grossCaps[i] = grossCap
-			netCap := grossCap
-			if src.SubtotalCents > 0 {
-				netCap = money.RoundHalfToEven(grossCap*src.SubtotalCents, src.TotalAmountCents)
-			}
-			netCaps[i] = netCap
-		default:
-			grossCaps[i] = src.TotalAmountCents
-			netCaps[i] = totalUnused // non-binding
-		}
-	}
-
-	nets, remainder := money.AllocateByWeightCapped(totalUnused, weights, netCaps)
-	if remainder > 0 {
-		var placed int64
-		for _, n := range nets {
-			placed += n
-		}
-		if hasUnpaid {
-			// Mixed/unpaid set: paid sources already absorbed all they could
-			// (the allocator water-fills overflow onto them first); the
-			// residual is value an UNPAID invoice can't relieve beyond its
-			// amount_due and applied credits — nothing else was paid for it,
-			// so there's nothing more to return. Not a fault, but log it.
-			slog.WarnContext(ctx, "unused-prebill credit: residual unplaceable on unpaid funding invoice(s)",
-				"subscription_id", sub.ID,
-				"placed_cents", placed,
-				"residual_cents", remainder,
-				"total_unused", totalUnused,
-				"funding_invoices", len(sources))
-		} else {
-			// All-paid set: earlier credit notes (an operator note, or a
-			// waiver after customer credits paid part of the invoice) left
-			// less room than the unused part. Place what fits; the caps keep
-			// every invoice's credit within its total (#276-#278). Loud,
-			// because it can also mean drift. With no room at all, nothing is
-			// placed: the period is already fully credited.
-			slog.ErrorContext(ctx, "unused-prebill credit: funding invoices' remaining room is smaller than the unused part; placed what fits",
-				"subscription_id", sub.ID,
-				"placed_cents", placed,
-				"residual_cents", remainder,
-				"total_unused", totalUnused,
-				"funding_invoices", len(sources))
-		}
-	}
-
-	var shares []fundingShare
-	for i, src := range sources {
-		net := nets[i]
-		if net <= 0 {
-			continue
-		}
-		sh := fundingShare{Source: src, NetCents: net}
-		if src.PaymentStatus == domain.PaymentSucceeded {
-			gross := net
-			if src.SubtotalCents > 0 {
-				gross = money.RoundHalfToEven(net*src.TotalAmountCents, src.SubtotalCents)
-			}
-			if gross > grossCaps[i] {
-				gross = grossCaps[i] // clamp net→gross rounding overshoot to headroom
-			}
-			sh.GrossCents = gross
-		}
-		shares = append(shares, sh)
-	}
-	return shares, nil
 }
 
 // invoicePage returns one page of a background invoice queue after the

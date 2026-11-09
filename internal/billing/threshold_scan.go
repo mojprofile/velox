@@ -369,7 +369,21 @@ type thresholdWatermark struct {
 // ErrNotFound = no fire = zero watermark, nil error. Any other failure is
 // loud: closing blind risks a double charge (feedback_no_silent_fallbacks).
 func (e *Engine) loadThresholdWatermark(ctx context.Context, tenantID, subID string, periodStart, periodEnd time.Time) (thresholdWatermark, error) {
-	wmInv, err := e.invoices.GetLatestThresholdInvoiceForCycle(ctx, tenantID, subID, periodStart, periodEnd)
+	return e.loadThresholdWatermarkTx(ctx, nil, tenantID, subID, periodStart, periodEnd)
+}
+
+// loadThresholdWatermarkTx is loadThresholdWatermark with the fire invoice read
+// on tx (nil: its own connection). A closer that holds the subscription row
+// lock reads on its tx, after the lock: a fire commits under the same lock, so
+// every fire committed before it is seen (BillOnPlanSwapTx).
+func (e *Engine) loadThresholdWatermarkTx(ctx context.Context, tx *sql.Tx, tenantID, subID string, periodStart, periodEnd time.Time) (thresholdWatermark, error) {
+	var wmInv domain.Invoice
+	var err error
+	if tx != nil {
+		wmInv, err = e.invoices.GetLatestThresholdInvoiceForCycleTx(ctx, tx, tenantID, subID, periodStart, periodEnd)
+	} else {
+		wmInv, err = e.invoices.GetLatestThresholdInvoiceForCycle(ctx, tenantID, subID, periodStart, periodEnd)
+	}
 	if errors.Is(err, errs.ErrNotFound) {
 		return thresholdWatermark{}, nil
 	}
@@ -582,7 +596,7 @@ func (e *Engine) evaluateThresholds(ctx context.Context, sub domain.Subscription
 		//     refires one invoice + card charge per scheduler tick.
 		//
 		// Classification is per RULE BUCKET (pl.AggregationMode rides from
-		// AggregateByPricingRules through previewMeter), never per meter — one
+		// AggregateByPricingRules through rateMeterWindow), never per meter — one
 		// meter can carry sum and max rules simultaneously.
 		if pl.LineType == "usage" && nonAdditiveMode(pl.AggregationMode) {
 			if !reset {
@@ -597,9 +611,13 @@ func (e *Engine) evaluateThresholds(ctx context.Context, sub domain.Subscription
 		if currency == "" {
 			currency = pl.Currency
 		}
+		// A usage line's window is the one its meter was rated over: from
+		// the meter's usage floor (trial end, another subscription's
+		// coverage end), not always the period start (ADR-012 amendment
+		// 2026-10-22).
 		var ps, pe *time.Time
 		if pl.LineType == "usage" {
-			s := periodStart
+			s := preview.floors.start(pl.MeterID, periodStart, now)
 			n := now
 			ps = &s
 			pe = &n
@@ -662,7 +680,8 @@ func (e *Engine) evaluateThresholds(ctx context.Context, sub domain.Subscription
 	}
 
 	// Per-item caps: sum the running quantity across each item's plan
-	// meters during [periodStart, now). The meter quantity is the same
+	// meters during [floor, now), the window the fire bills each meter over
+	// (the preview's usage floors). The meter quantity is the same
 	// figure the natural cycle would bill — pulled from the priority+claim
 	// resolver via AggregateByPricingRules. Item-to-meter is via the plan
 	// (item.plan_id -> plan.meter_ids). Cross-currency items already
@@ -686,8 +705,12 @@ func (e *Engine) evaluateThresholds(ctx context.Context, sub domain.Subscription
 				if mErr != nil {
 					return thresholdEval{}, fmt.Errorf("item threshold: get meter %s: %w", meterID, mErr)
 				}
+				from := preview.floors.start(meterID, periodStart, now)
+				if !from.Before(now) {
+					continue
+				}
 				defaultMode := mapMeterAggregation(meter.Aggregation)
-				aggs, aErr := e.usage.AggregateByPricingRules(ctx, sub.TenantID, sub.CustomerID, meterID, defaultMode, periodStart, now)
+				aggs, aErr := e.usage.AggregateByPricingRules(ctx, sub.TenantID, sub.CustomerID, meterID, defaultMode, from, now)
 				if aErr != nil {
 					return thresholdEval{}, fmt.Errorf("item threshold: aggregate meter %s: %w", meterID, aErr)
 				}

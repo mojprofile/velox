@@ -48,9 +48,10 @@ type CardDetails struct {
 
 // CardFetcher fetches card details from Stripe.
 //
-// FetchCardDetails returns the customer's *default* PM card. Used
-// by dunning to render "we'll retry charging Visa •••• 4242 in 3
-// days" copy.
+// FetchCardDetails returns the NEWEST card saved on the Stripe customer
+// (by created time), not Stripe's or Velox's default. RecordCheckoutCard
+// uses it to find the card a finished Checkout session just saved; it
+// reads only and never changes Stripe's default.
 //
 // FetchCardForPaymentIntent returns the card actually charged on a
 // specific PaymentIntent. Used by the payment-succeeded webhook
@@ -395,12 +396,17 @@ func (s *Stripe) SetBreaker(b *breaker.Breaker) {
 // and ack'd but no payment_methods row is created. In practice the
 // router always wires paymentmethods.Service here.
 //
+// makeDefault makes the card the customer's default, the card Velox charges
+// next: set for a card saved through a Velox setup flow (ADR-021). Without
+// it the store's rule decides (the first card, or one replacing a default
+// the bank refused for good, becomes the default; any other is added beside).
+//
 // The method name is AttachForWebhook (not AttachFromSetupIntent) so
 // paymentmethods.Service can keep its richer AttachFromSetupIntent
 // method — returning (PaymentMethod, error) — for tests and direct
 // callers, while this package imports nothing from paymentmethods.
 type PaymentMethodAttacher interface {
-	AttachForWebhook(ctx context.Context, tenantID, customerID, stripePaymentMethodID string) error
+	AttachForWebhook(ctx context.Context, tenantID, customerID, stripePaymentMethodID string, makeDefault bool) error
 }
 
 // SetPaymentMethodAttacher configures the handler that processes
@@ -509,7 +515,17 @@ func (s *Stripe) fireEvent(ctx context.Context, tenantID, eventType string, payl
 // re-checks it right before sending and sends nothing when it no longer
 // holds.
 func (s *Stripe) ChargeInvoice(ctx context.Context, tenantID string, inv domain.Invoice, hold domain.ChargeHold, stripeCustomerID, stripePaymentMethodID string) (domain.Invoice, error) {
-	return s.chargeInvoice(ctx, tenantID, inv, hold, stripeCustomerID, stripePaymentMethodID, "")
+	return s.chargeInvoice(ctx, tenantID, inv, hold, stripeCustomerID, stripePaymentMethodID, "", domain.ChargeTriggerAutoCharge)
+}
+
+// ChargeInvoiceNow is the charge someone asked for: "Charge now" in the
+// dashboard, or POST /v1/invoices/{id}/collect. It charges exactly as
+// ChargeInvoice does: the same PaymentIntent metadata and the same
+// idempotency key, so Stripe sees no difference. Only the attempt row's
+// trigger differs (charge_now, ADR-128 PR 6): it answers "why was this
+// charged?", and the row's actor says who asked.
+func (s *Stripe) ChargeInvoiceNow(ctx context.Context, tenantID string, inv domain.Invoice, hold domain.ChargeHold, stripeCustomerID, stripePaymentMethodID string) (domain.Invoice, error) {
+	return s.chargeInvoice(ctx, tenantID, inv, hold, stripeCustomerID, stripePaymentMethodID, "", domain.ChargeTriggerChargeNow)
 }
 
 // ChargeInvoiceForDunningRetry charges an invoice as part of a dunning
@@ -526,7 +542,7 @@ func (s *Stripe) ChargeInvoice(ctx context.Context, tenantID string, inv domain.
 // (billing → payment) is avoided per the per-domain-isolation rule
 // in CLAUDE.md.
 func (s *Stripe) ChargeInvoiceForDunningRetry(ctx context.Context, tenantID string, inv domain.Invoice, hold domain.ChargeHold, stripeCustomerID, stripePaymentMethodID string) (domain.Invoice, error) {
-	return s.chargeInvoice(ctx, tenantID, inv, hold, stripeCustomerID, stripePaymentMethodID, piPurposeDunningRetry)
+	return s.chargeInvoice(ctx, tenantID, inv, hold, stripeCustomerID, stripePaymentMethodID, piPurposeDunningRetry, domain.ChargeTriggerDunningRetry)
 }
 
 // ChargeIdempotencyKey is the SINGLE SOURCE for an invoice charge's Stripe
@@ -573,7 +589,10 @@ func ChargeIdempotencyKey(invoiceID string, chargeAttemptSeq int64, purpose stri
 	return key
 }
 
-func (s *Stripe) chargeInvoice(ctx context.Context, tenantID string, inv domain.Invoice, hold domain.ChargeHold, stripeCustomerID, stripePaymentMethodID, purpose string) (domain.Invoice, error) {
+// chargeInvoice is the one charge path. purpose is the PaymentIntent's
+// velox_purpose metadata, which Stripe sees and the idempotency key carries;
+// trigger is the attempt row's trigger_source, which only Velox sees.
+func (s *Stripe) chargeInvoice(ctx context.Context, tenantID string, inv domain.Invoice, hold domain.ChargeHold, stripeCustomerID, stripePaymentMethodID, purpose string, trigger domain.ChargeAttemptTrigger) (domain.Invoice, error) {
 	// finalized ONLY (ADR-113: nothing initiates money against a written-off
 	// invoice). This belt gate is not redundant with the claims: every claim
 	// reads BEFORE the handler re-reads the invoice, so a MarkUncollectible
@@ -828,7 +847,7 @@ func (s *Stripe) chargeInvoice(ctx context.Context, tenantID string, inv domain.
 		if pe.Unknown {
 			attemptOutcome = domain.ChargeAttemptUnknown
 		}
-		recordChargeAttempt(saveCtx, s.invoices, tenantID, inv, pe.PaymentIntentID, purpose, attemptOutcome, pe.Message,
+		recordChargeAttempt(saveCtx, s.invoices, tenantID, inv, pe.PaymentIntentID, trigger, attemptOutcome, pe.Message,
 			chargedCard{paymentMethodID: stripePaymentMethodID, declineCode: pe.DeclineCode})
 
 		if !pe.Unknown && pe.PaymentIntentID != "" {
@@ -919,7 +938,7 @@ func (s *Stripe) chargeInvoice(ctx context.Context, tenantID string, inv domain.
 	// ADR-102: insert the attempt at PI-create time so trigger_source
 	// and the sim anchor are recorded by the writer that knows them;
 	// the settle paths only flip the outcome.
-	recordChargeAttempt(ctx, s.invoices, tenantID, inv, result.ID, purpose, domain.ChargeAttemptPending, "",
+	recordChargeAttempt(ctx, s.invoices, tenantID, inv, result.ID, trigger, domain.ChargeAttemptPending, "",
 		chargedCard{paymentMethodID: stripePaymentMethodID})
 
 	// Honor the synchronous confirmation outcome (ADR-049 Phase 3,
@@ -1327,11 +1346,7 @@ type chargedCard struct {
 	declineCode     string
 }
 
-func recordChargeAttempt(ctx context.Context, invoices InvoiceUpdater, tenantID string, inv domain.Invoice, piID, purpose string, outcome domain.ChargeAttemptOutcome, reason string, card chargedCard) {
-	trigger := domain.ChargeTriggerAutoCharge
-	if purpose == piPurposeDunningRetry {
-		trigger = domain.ChargeTriggerDunningRetry
-	}
+func recordChargeAttempt(ctx context.Context, invoices InvoiceUpdater, tenantID string, inv domain.Invoice, piID string, trigger domain.ChargeAttemptTrigger, outcome domain.ChargeAttemptOutcome, reason string, card chargedCard) {
 	var simAt *time.Time
 	if sim, ok := clock.SimOf(ctx); ok {
 		t := sim.At
@@ -1493,11 +1508,19 @@ func (s *Stripe) handleSetupIntentSucceeded(ctx context.Context, tenantID string
 
 	customerID := parsed.Data.Object.Metadata["velox_customer_id"]
 	pmID := parsed.Data.Object.PaymentMethod
+	// A SetupIntent Velox created (all three of its Checkout setup sessions
+	// stamp velox_customer_id in setup_intent_data.metadata: the operator's
+	// Add payment method link, the customer's payment-update link, legacy
+	// POST /v1/checkout/setup) saved a card to be charged: it becomes the
+	// default (ADR-021). Read before the resolver fallback below, which also
+	// lets in SetupIntents Velox did not create; their card is added beside.
+	fromVeloxSetup := customerID != ""
 
 	// Metadata is best-effort: Stripe Checkout doesn't copy a session's
 	// metadata onto the underlying SetupIntent unless the creator set
-	// setup_intent_data.metadata, and the hosted "update payment" and
-	// operator add-card Checkout flows don't. Fall back to the SetupIntent's
+	// setup_intent_data.metadata. Velox's setup sessions do; a SetupIntent
+	// Velox did not create, or one from a session made before that stamp
+	// shipped, carries none. Fall back to the SetupIntent's
 	// authoritative `customer` field — always set for our customer-scoped
 	// setup flows — so a saved card lands in payment_methods regardless of
 	// which flow created the session. A non-NotFound resolver error is
@@ -1549,7 +1572,7 @@ func (s *Stripe) handleSetupIntentSucceeded(ctx context.Context, tenantID string
 		ctx = veloxauth.WithCustomerActor(ctx, customerID)
 	}
 
-	if err := s.pmAttacher.AttachForWebhook(ctx, tenantID, customerID, pmID); err != nil {
+	if err := s.pmAttacher.AttachForWebhook(ctx, tenantID, customerID, pmID, fromVeloxSetup); err != nil {
 		return fmt.Errorf("attach payment method: %w", err)
 	}
 
@@ -2041,11 +2064,15 @@ func (s *Stripe) RecordCheckoutCard(ctx context.Context, tenantID, customerID, s
 	// ever came, and the card the customer paid with was never recorded:
 	// Velox kept charging its old card, or none (found 2026-10-11: Stripe
 	// held two saved 4242 cards for a customer whose Velox record had only
-	// the declining 0341). The attach follows the store's default rule: the
-	// customer's first card becomes the default; another card is added
-	// without replacing it, as Add card does.
+	// the declining 0341). The attach follows the store's default rule
+	// (makeDefault false): the customer's first card becomes the default, a
+	// card replacing a default the bank refused for good does too, and any
+	// other is added beside the working default. The card here is a guess,
+	// the newest on the Stripe customer, so it never takes the default by
+	// itself: for a setup-mode session, setup_intent.succeeded carries the
+	// exact card and is the one writer that makes it the default.
 	if s.pmAttacher != nil && card.PaymentMethodID != "" {
-		if err := s.pmAttacher.AttachForWebhook(ctx, tenantID, customerID, card.PaymentMethodID); err != nil {
+		if err := s.pmAttacher.AttachForWebhook(ctx, tenantID, customerID, card.PaymentMethodID, false); err != nil {
 			return fmt.Errorf("record the checkout's card: %w", err)
 		}
 	}

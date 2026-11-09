@@ -87,14 +87,21 @@ type Biller interface {
 	// BillOnCreateTx is the in-tx variant of BillOnCreate: it inserts the day-1
 	// in_advance invoice on the caller's tx (no finalize). ok=false means there
 	// was nothing to bill (no in_advance items / zero subtotal) or an idempotent
-	// skip. Used by the atomic cross-interval swap so the new-period invoice
-	// commits atomically with the plan write + watermark advance. startAt is
-	// the instant the billed period began (the trial end on a trial flip,
-	// the request's now otherwise); the pause is read as it stood then.
+	// skip. Used by create, activate and the trial flip. startAt is the
+	// instant the billed period began (the trial end on a trial flip, the
+	// request's now otherwise); the pause is read as it stood then.
 	BillOnCreateTx(ctx context.Context, tx *sql.Tx, sub domain.Subscription, startAt time.Time) (domain.Invoice, bool, error)
+	// BillOnPlanSwapTx inserts, on the caller's tx, the invoice of an
+	// immediate in_advance cross-interval swap at `at`: after's new-period
+	// base plus the usage of before's period over [its start, at), which the
+	// swap closes (ADR-056, ADR-031 renewal shape). before is the pre-swap
+	// snapshot the swap proved under the row lock. ok=false means nothing to
+	// bill. afterCommit is never nil; the caller runs it only once the tx
+	// commits (it counts usage the invoice left unpriced).
+	BillOnPlanSwapTx(ctx context.Context, tx *sql.Tx, before, after domain.Subscription, at time.Time) (inv domain.Invoice, ok bool, afterCommit func(), err error)
 	// FinalizeOnCreateInvoice runs the post-commit external steps (audit, tax
-	// commit, auto-charge) for an invoice inserted via BillOnCreateTx. Called
-	// AFTER the tx commits — never inside it.
+	// commit, auto-charge) for an invoice inserted via BillOnCreateTx or
+	// BillOnPlanSwapTx. Called AFTER the tx commits — never inside it.
 	FinalizeOnCreateInvoice(ctx context.Context, sub domain.Subscription, inv domain.Invoice)
 }
 
@@ -637,16 +644,18 @@ type CreateItemInput struct {
 	Quantity int64  `json:"quantity,omitempty"`
 }
 
+// maxTrialDays is the longest trial create and extend-trial accept: two
+// years, Stripe's limit for trial_end.
+const maxTrialDays = 730
+
 type CreateInput struct {
-	Code          string                         `json:"code"`
-	DisplayName   string                         `json:"display_name"`
-	CustomerID    string                         `json:"customer_id"`
-	Items         []CreateItemInput              `json:"items"`
-	BillingTime   domain.SubscriptionBillingTime `json:"billing_time"`
-	TrialDays     int                            `json:"trial_days,omitempty"`
-	StartNow      bool                           `json:"start_now,omitempty"`
-	UsageCapUnits *int64                         `json:"usage_cap_units,omitempty"`
-	OverageAction string                         `json:"overage_action,omitempty"`
+	Code        string                         `json:"code"`
+	DisplayName string                         `json:"display_name"`
+	CustomerID  string                         `json:"customer_id"`
+	Items       []CreateItemInput              `json:"items"`
+	BillingTime domain.SubscriptionBillingTime `json:"billing_time"`
+	TrialDays   int                            `json:"trial_days,omitempty"`
+	StartNow    bool                           `json:"start_now,omitempty"`
 }
 
 func (s *Service) Create(ctx context.Context, tenantID string, input CreateInput) (domain.Subscription, error) {
@@ -698,6 +707,12 @@ func (s *Service) Create(ctx context.Context, tenantID string, input CreateInput
 	}
 	if billingTime != domain.BillingTimeCalendar && billingTime != domain.BillingTimeAnniversary {
 		return domain.Subscription{}, errs.Invalid("billing_time", "must be calendar or anniversary")
+	}
+	// A negative trial_days used to read as "no trial", so with start_now the
+	// customer was charged on day 1. The upper bound is Stripe's: a trial
+	// "can be at most two years". A longer pause in billing is not a trial.
+	if input.TrialDays < 0 || input.TrialDays > maxTrialDays {
+		return domain.Subscription{}, errs.Invalid("trial_days", fmt.Sprintf("must be between 0 and %d", maxTrialDays))
 	}
 
 	// Reject mixed billing intervals across items (Stripe / Lago parity).
@@ -844,11 +859,6 @@ func (s *Service) Create(ctx context.Context, tenantID string, input CreateInput
 		billingAnchorDay = anchorDay
 	}
 
-	overageAction := input.OverageAction
-	if overageAction == "" {
-		overageAction = "charge"
-	}
-
 	// ADR-031: in_advance plans get a day-1 invoice covering the upcoming
 	// period's base fee. Build it IN THE SAME tx as the subscription insert
 	// (ADR-056 coordinator) so a billing failure rolls the whole create back
@@ -874,8 +884,6 @@ func (s *Service) Create(ctx context.Context, tenantID string, input CreateInput
 		CurrentBillingPeriodEnd:   periodEnd,
 		NextBillingAt:             nextBilling,
 		BillingAnchorDay:          billingAnchorDay,
-		UsageCapUnits:             input.UsageCapUnits,
-		OverageAction:             overageAction,
 		TestClockID:               inheritedClockID,
 		Items:                     items,
 	}, func(tx *sql.Tx, created domain.Subscription) error {
@@ -1031,7 +1039,8 @@ type ItemChangeResult struct {
 	// firing handleItemProration on top would emit a second credit
 	// against the same OLD period and over-credit the customer.
 	OrchestratedCrossAxis bool `json:"-"`
-	// crossAxisNewInvoice carries the new-period in_advance invoice created
+	// crossAxisNewInvoice carries the swap invoice (the new in_advance
+	// period's base plus the old period's usage up to the swap) created
 	// in-tx by the atomic cross-interval swap (applyCrossIntervalPlanSwapTx),
 	// so the handler can run FinalizeOnCreateInvoice (tax commit + auto-charge)
 	// POST-commit. nil when the swap was in_arrears (no day-1 invoice).
@@ -1041,6 +1050,10 @@ type ItemChangeResult struct {
 	// BillOnPlanSwapDraftsTx; FinalizeCrossIntervalSwap runs its post-commit
 	// legs.
 	swapRelief domain.Relief
+	// swapAfterCommit is BillOnPlanSwapTx's afterCommit, which
+	// FinalizeCrossIntervalSwap runs once the swap tx committed. nil when the
+	// swap billed nothing in-tx (in_arrears).
+	swapAfterCommit func()
 	// pricedFrom is the state the change replaced: the subscription and the
 	// item as UpdateItemTx or RemoveItemTx found them under the subscription
 	// row lock (#1270); for AddItemTx, the subscription only. The handler
@@ -1074,29 +1087,22 @@ type ProrationDetail struct {
 	// credit-path (downgrade) prorations and manual/none providers.
 	TaxProvider      string `json:"-"`
 	TaxCalculationID string `json:"-"`
-	// Clawback* carry a downgrade clawback that must be issued as a tax-
-	// reversing credit note AFTER the atomic tx commits — the credit-note
-	// service is not tx-aware and its tax reversal is an external Stripe call,
-	// so it can't ride the DB tx (a rollback would orphan a committed CN +
-	// balance grant). Set only on the downgrade-credit path when the CN issuer
-	// is wired and a PAID source invoice was resolved (ADR-048); empty
-	// otherwise (legacy net-grant fallback, upgrade/invoice path). Internal —
-	// not API surface.
-	ClawbackInvoiceID  string `json:"-"`
-	ClawbackGrossCents int64  `json:"-"`
-	ClawbackReason     string `json:"-"`
-	ClawbackMemo       string `json:"-"`
-	// ClawbackPieces fans a downgrade/qty-decrease/item-removal clawback across
-	// EVERY funding invoice of the period — LIFO (newest funding invoice first)
-	// for a plan downgrade, proportional for fungible qty/item changes — each a
-	// tax-reversing adjustment credit note against its own invoice. When
-	// non-empty it supersedes the scalar Clawback* fields (which remain the
-	// single-piece carrier for the unpaid-source amount_due relief path). On the
-	// ATOMIC path each piece is CREATED as a draft IN the caller's tx
-	// (createClawbackDraftsTx → ClawbackDraftIDs) so it commits with the item
-	// change, then ISSUED post-commit (issueClawbackDrafts); the non-atomic
-	// fallback still create+issues inline via issueClawbackCreditNote.
-	ClawbackPieces []ClawbackPiece `json:"-"`
+	// Clawback* carry the credit for unused time (a downgrade, quantity
+	// decrease or item removal), issued as tax-reversing adjustment credit
+	// notes AFTER the atomic tx commits: the credit-note service's tax reversal
+	// is an external Stripe call, so it can't ride the DB tx. ClawbackPieces
+	// are the shares domain.AllocateUnusedCredit placed, one per invoice that
+	// charged the item, newest first (ADR-118). On the ATOMIC path each is
+	// CREATED as a draft IN the caller's tx (createClawbackDraftsTx →
+	// ClawbackDraftIDs) so it commits with the item change, then ISSUED
+	// post-commit (issueClawbackDrafts); the non-atomic path create+issues
+	// inline via issueClawbackCreditNote. Internal — not API surface.
+	ClawbackReason string               `json:"-"`
+	ClawbackMemo   string               `json:"-"`
+	ClawbackPieces []domain.CreditShare `json:"-"`
+	// UncreditedCents (net) is the unused time the invoices had no room left
+	// for. It is not owed; the audit row records it (uncredited_cents).
+	UncreditedCents int64 `json:"-"`
 	// ClawbackDraftIDs are the draft credit notes createClawbackDraftsTx wrote
 	// IN the atomic tx (atomic with the item change). issueClawbackDrafts issues
 	// them post-commit; RetryPendingClawbackIssue re-issues any whose Issue()
@@ -1114,15 +1120,6 @@ type ProrationDetail struct {
 	// (dispatchProrationFinalized). nil for a draft, a credit and the dedup
 	// replay.
 	finalizedInvoice *domain.Invoice
-}
-
-// ClawbackPiece is one funding invoice's slice of a multi-invoice downgrade
-// clawback. Each is issued as its own tax-reversing adjustment credit note
-// against InvoiceID for GrossCents (tax-inclusive), reversing that invoice's
-// own proportional output tax. The pieces sum to the clawback's total gross.
-type ClawbackPiece struct {
-	InvoiceID  string
-	GrossCents int64
 }
 
 // addItemQuantity checks the request alone and returns the quantity to
@@ -1680,8 +1677,10 @@ func (s *Service) UpdateItem(ctx context.Context, tenantID, subscriptionID, item
 		//   in_advance: refund the unused portion of the OLD prepaid
 		//   period (BillOnPlanSwapDraftsTx), jump current_period
 		//   to (now, NextBillingPeriodEnd for NEW interval), and
-		//   synchronously bill the NEW in_advance period (with stub
-		//   proration if calendar snap shortens it).
+		//   synchronously bill one invoice (BillOnPlanSwapTx): the NEW
+		//   in_advance period's base (with stub proration if calendar
+		//   snap shortens it) plus the OLD plan's usage over
+		//   (oldPS, now), which the jump closes.
 		//
 		//   in_arrears: truncate current_period to (oldPS, now). The
 		//   scheduler / catchup picks up next_billing_at=now, closes
@@ -1738,8 +1737,9 @@ func mapPeriodMoved(err error) error {
 // plan swap — the only restructure-the-cycle plan change Velox supports —
 // run on the handler's tx. It runs the
 // cycle-restructuring DB writes — the period CAS (first statement, ADR-115),
-// the refund drafts, the plan swap, and (for in_advance) the new-period invoice
-// insert via BillOnCreateTx — on the caller's single tx, so any failure rolls
+// the refund drafts, the plan swap, and (for in_advance) the swap invoice
+// insert via BillOnPlanSwapTx (the new period's base plus the old period's
+// usage up to now) — on the caller's single tx, so any failure rolls
 // ALL of them back. This is the fix for the
 // silent revenue drop: the watermark can no longer advance past a new in_advance
 // period whose day-1 invoice failed to commit. The OLD-period refund and the new
@@ -1875,10 +1875,14 @@ func (s *Service) applyCrossIntervalPlanSwapTx(
 		}
 		prospective.Items = items
 
-		inv, ok, err := s.biller.BillOnCreateTx(ctx, tx, prospective, now)
+		// The jump to [now, newPE) closes [oldPS, now): the swap invoice bills
+		// that window's usage beside the new base. sub is the pre-swap
+		// snapshot the CAS and the item check above proved.
+		inv, ok, afterCommit, err := s.biller.BillOnPlanSwapTx(ctx, tx, sub, prospective, now)
 		if err != nil {
 			return ItemChangeResult{}, fmt.Errorf("plan-swap new in_advance bill: %w", err)
 		}
+		res.swapAfterCommit = afterCommit
 		if ok {
 			invCopy := inv
 			res.crossAxisNewInvoice = &invCopy
@@ -1895,9 +1899,13 @@ func (s *Service) applyCrossIntervalPlanSwapTx(
 //     BillOnPlanSwapDraftsTx (ADR-118); here only its post-commit legs run
 //     (draft Issue; a void's tax reversal and webhook), each recovered by its
 //     own sweep if this fails.
-//   - FinalizeOnCreateInvoice (tax commit + auto-charge) for the new in_advance
-//     day-1 invoice committed inside the swap tx, if one was created.
+//   - FinalizeOnCreateInvoice (tax commit + auto-charge) for the swap invoice
+//     committed inside the swap tx, if one was created.
+//   - The swap invoice's afterCommit (counts usage it left unpriced).
 func (s *Service) FinalizeCrossIntervalSwap(ctx context.Context, tenantID string, subBefore domain.Subscription, result ItemChangeResult) {
+	if result.swapAfterCommit != nil {
+		result.swapAfterCommit()
+	}
 	var inv domain.Invoice
 	if result.crossAxisNewInvoice != nil {
 		inv = *result.crossAxisNewInvoice
@@ -2088,7 +2096,7 @@ func (s *Service) FireDueScheduledCancel(ctx context.Context, tenantID, id strin
 	afterBillCommit := func() {}
 	var relief domain.Relief
 	canceled, err := s.store.FireScheduledCancellationWithBill(ctx, tenantID, id, at, func(tx *sql.Tx, c domain.Subscription) error {
-		emitAudit := func(credited int64, currency string) error {
+		emitAudit := func(r domain.Relief, currency string) error {
 			if s.audit == nil {
 				return nil
 			}
@@ -2097,12 +2105,7 @@ func (s *Service) FireDueScheduledCancel(ctx context.Context, tenantID, id strin
 				"plan_ids":    planIDsFromItems(c.Items),
 				"canceled_by": "schedule",
 			}
-			if credited > 0 {
-				meta["prorated_credit_cents"] = credited
-				if currency != "" {
-					meta["currency"] = currency
-				}
-			}
+			addReliefMeta(meta, r, currency)
 			if auditErr := s.audit.LogInTx(ctx, tx, audit.Entry{
 				Action:        domain.AuditActionCancel,
 				ResourceType:  "subscription",
@@ -2115,7 +2118,7 @@ func (s *Service) FireDueScheduledCancel(ctx context.Context, tenantID, id strin
 			return nil
 		}
 		if s.biller == nil {
-			return emitAudit(0, "")
+			return emitAudit(domain.Relief{}, "")
 		}
 		inv, afterCommit, billErr := s.biller.BillFinalOnImmediateCancelTx(ctx, tx, c)
 		if billErr != nil {
@@ -2128,7 +2131,7 @@ func (s *Service) FireDueScheduledCancel(ctx context.Context, tenantID, id strin
 			return fmt.Errorf("scheduled-cancel proration relief: %w", reliefErr)
 		}
 		relief = r
-		return emitAudit(r.CreditedCents, inv.Currency)
+		return emitAudit(r, inv.Currency)
 	})
 	if err != nil {
 		// Only the fire's own race outcomes are benign. A relief or billing
@@ -2276,7 +2279,7 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) (domain.Subsc
 		// UNCONDITIONALLY: audit coverage must not be conditioned on the
 		// unrelated biller dependency (a biller-less construction still
 		// flips the sub to canceled).
-		emitCancelAudit := func(credited int64, currency string) error {
+		emitCancelAudit := func(r domain.Relief, currency string) error {
 			if s.audit == nil {
 				return nil
 			}
@@ -2285,15 +2288,7 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) (domain.Subsc
 				"plan_ids":    planIDsFromItems(c.Items),
 				"canceled_by": cancelActorLabel(ctx),
 			}
-			if credited > 0 {
-				meta["prorated_credit_cents"] = credited
-				// Currency from the final invoice built in this same tx;
-				// credit-only cancels (no final invoice) omit it and the
-				// timeline falls back to its default rendering.
-				if currency != "" {
-					meta["currency"] = currency
-				}
-			}
+			addReliefMeta(meta, r, currency)
 			// No sim field: Cancel's entry points bind the sub's pin onto ctx
 			// (bindForSub), and the Logger derives the sim axis from that
 			// binding. The hand-rolled pairing this replaces read the clock id
@@ -2312,7 +2307,7 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) (domain.Subsc
 			return nil
 		}
 		if s.biller == nil {
-			return emitCancelAudit(0, "")
+			return emitCancelAudit(domain.Relief{}, "")
 		}
 		inv, afterCommit, billErr := s.biller.BillFinalOnImmediateCancelTx(ctx, tx, c)
 		if billErr != nil {
@@ -2329,7 +2324,7 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) (domain.Subsc
 		}
 		relief = r
 
-		return emitCancelAudit(r.CreditedCents, inv.Currency)
+		return emitCancelAudit(r, inv.Currency)
 	})
 	if err != nil {
 		return domain.Subscription{}, 0, err
@@ -2591,9 +2586,17 @@ type PauseCollectionInput struct {
 }
 
 // PauseCollection sets the Stripe-parity collection-pause state. Distinct
-// from Pause (hard freeze on status). The cycle keeps advancing; the engine
-// generates the invoice as draft and skips finalize/charge/dunning while
-// pause_collection is non-null.
+// from Pause (hard freeze on status). The cycle keeps advancing; while
+// pause_collection is non-null the engine generates each new invoice as a
+// draft, so it is not finalized, not charged and starts no dunning run.
+//
+// It does not stop collection on invoices finalized before the pause. A
+// dunning run already open on one keeps its retry schedule and charges the
+// customer's default card, as Stripe keeps retrying invoices created before a
+// pause unless they are voided. Only the charge sweeps (the queued auto-charge
+// and the charge when a card is added) skip a paused subscription. To stop an
+// open run, void the invoice or mark it uncollectible (ADR-036, amended
+// 2026-10-22).
 //
 // Idempotent: a second call with the same input replaces the row's
 // pause_collection_* columns with the same values. Switching from one
@@ -2814,13 +2817,11 @@ func (s *Service) cancelTrialAtEnd(ctx context.Context, tenantID string, sub dom
 		"triggered_by": "schedule",
 		"canceled_at":  canceled.CanceledAt.UTC().Format(time.RFC3339),
 	}
-	// The trial-end instant is its OWN fact, under its own key. It is NOT the
-	// row's sim_effective_at: that column means "the simulated instant the
-	// clock stood at when this mutation was performed", and the audit writer
-	// owns it from the ctx binding (simColumns). A catchup performs this cancel
-	// at the advance's instant, which may be weeks of simulated time after the
-	// trial actually ended — two different facts that used to collide on one
-	// key, with the writer silently winning.
+	// The trial-end instant is its OWN fact, under its own key. The row's
+	// sim_effective_at is a separate column the audit writer owns from the
+	// ctx binding (simColumns); the two used to collide on one key, with the
+	// writer silently winning. The catchup binds ctx to trial_end_at before
+	// calling this (B12), so on a test clock both now carry the same instant.
 	if sub.TrialEndAt != nil {
 		meta["trial_end_at"] = sub.TrialEndAt.UTC().Format(time.RFC3339)
 	}
@@ -2867,7 +2868,14 @@ func (s *Service) ProcessExpiredTrialsForClock(ctx context.Context, tenantID, cl
 			continue
 		}
 		trialEndAt := *sub.TrialEndAt
-		bound := s.bindForSub(ctx, tenantID, sub.ID)
+		// The trial ends at trial_end_at, not wherever the advance landed
+		// (B12): override the INSTANT while keeping the CLOCK, as the pause
+		// resume below does. Every branch runs on this ctx: the flip's audit
+		// row, the day-1 invoice (issued at trial_end_at, see
+		// buildOnCreateInvoice), its finalize row and collection, and the
+		// free cancel's row. Nested binds of the same clock inherit it
+		// (clock.BindEffectiveNow).
+		bound := clock.WithSim(s.bindForSub(ctx, tenantID, sub.ID), clock.Sim{At: trialEndAt, TestClockID: clockID})
 		// ADR-069 routing: a due cancel schedule means CANCEL FREE, never
 		// activate-and-bill. The SQL guard on the activation UPDATE is the
 		// atomic backstop for a schedule landing after this snapshot.
@@ -2926,9 +2934,10 @@ func (s *Service) ProcessExpiredTrialsForClock(ctx context.Context, tenantID, cl
 		// in webhooks and the Activity feed missed it (same asymmetry the
 		// scheduled-cancel + pause-auto-resume audits already fixed).
 		if s.audit != nil {
-			// trial_end_at is its own fact; the row's sim axis (test_clock_id +
-			// sim_effective_at) comes from the ctx binding on `bound`, which the
-			// audit writer owns. See cancelTrialAtEnd.
+			// trial_end_at is its own fact, on every trial-end writer; the
+			// row's sim axis (test_clock_id + sim_effective_at) comes from the
+			// ctx binding on `bound`, which the audit writer owns and which
+			// is trial_end_at here.
 			_ = s.audit.Log(bound, tenantID, domain.AuditActionUpdate, "subscription", activated.ID, activated.Code, map[string]any{
 				"action":       domain.SubAuditTrialEnded,
 				"customer_id":  activated.CustomerID,
@@ -3045,6 +3054,7 @@ func (s *Service) ProcessExpiredTrials(ctx context.Context, batch int) (int, []e
 				"action":       domain.SubAuditTrialEnded,
 				"customer_id":  activated.CustomerID,
 				"triggered_by": "schedule",
+				"trial_end_at": trialEndAt.UTC().Format(time.RFC3339),
 			})
 		}
 
@@ -3238,6 +3248,11 @@ func (s *Service) ExtendTrial(ctx context.Context, tenantID, id string, newTrial
 		return domain.Subscription{}, err
 	}
 	newEnd := newTrialEnd.UTC()
+	// The create bound holds here too: a trial ends at most maxTrialDays
+	// after it started, counted the way create counts trial_days.
+	if current.TrialStartAt != nil && newEnd.After(domain.AddDaysIn(*current.TrialStartAt, maxTrialDays, loc)) {
+		return domain.Subscription{}, errs.Invalid("trial_end", fmt.Sprintf("A trial can last at most %d days from its start. Pick an earlier date.", maxTrialDays))
+	}
 	interval := s.firstPlanInterval(ctx, tenantID, current.Items)
 	ps, pe, anchorDay := firstPeriodAfterTrial(newEnd, current.BillingTime, interval, loc)
 	return s.store.ExtendTrial(ctx, tenantID, id, newEnd, ps, pe, pe, anchorDay)
@@ -3362,4 +3377,21 @@ func (s *Service) SetBillingThresholds(ctx context.Context, tenantID, id string,
 func (s *Service) ClearBillingThresholds(ctx context.Context, tenantID, id string) (domain.Subscription, error) {
 	ctx = s.bindForSub(ctx, tenantID, id)
 	return s.store.ClearBillingThresholds(ctx, tenantID, id)
+}
+
+// addReliefMeta stamps a cancel's relief on its audit row: the balance credit
+// ("Prorated credit $X") and the unused time the funding invoices had no room
+// left for (uncredited_cents, ADR-118 amendment 2026-10-22). The currency is
+// the final invoice's, built in the same tx; a cancel with no final invoice
+// omits it and the timeline falls back to its default rendering.
+func addReliefMeta(meta map[string]any, r domain.Relief, currency string) {
+	if r.CreditedCents > 0 {
+		meta["prorated_credit_cents"] = r.CreditedCents
+	}
+	if r.UncreditedCents > 0 {
+		meta["uncredited_cents"] = r.UncreditedCents
+	}
+	if (r.CreditedCents > 0 || r.UncreditedCents > 0) && currency != "" {
+		meta["currency"] = currency
+	}
 }

@@ -314,7 +314,7 @@ test('closing an unpaid invoice: void gives back the credit it used, write-off c
   await expect(pause).not.toBeChecked()
   await pause.click()
   await expect(pause).toBeChecked()
-  await expect(writeOffDialog).toContainText('nothing is charged until you resume it')
+  await expect(writeOffDialog).toContainText('they stay drafts and nothing charges them. Retries already running on its other unpaid invoices continue.')
   await writeOffDialog.getByLabel(/^Type WRITE OFF to confirm/).fill('WRITE OFF')
   await writeOffDialog.getByRole('button', { name: 'Mark uncollectible' }).click()
   await expect(writeOffDialog).toBeHidden()
@@ -332,7 +332,11 @@ test('closing an unpaid invoice: void gives back the credit it used, write-off c
   await expect.soft(page.getByText('Collection on the subscription is paused.')).toBeVisible()
 
   // The subscription, opened from the invoice, offers to resume collection.
-  await page.getByRole('link', { name: subscription.display_name, exact: true }).click()
+  // The invoice names it in its details and on the Activity card's rows;
+  // this is the details link, so the Activity rows' links are left out.
+  await page.getByRole('link', { name: subscription.display_name, exact: true })
+    .and(page.locator(':not([data-activity-link])'))
+    .click()
   await expect(page.getByRole('heading', { name: subscription.display_name })).toBeVisible()
   await expect.soft(page.getByText('New invoices are saved as drafts and not charged.')).toBeVisible()
   await expect.soft(page.getByRole('button', { name: 'Resume collection' })).toBeVisible()
