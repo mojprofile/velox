@@ -66,6 +66,22 @@ func TestOutboxDispatcher_EnqueueFailureMetric(t *testing.T) {
 		}
 	})
 
+	t.Run("transaction start failure increments counter", func(t *testing.T) {
+		before := enqueueFailureCount(t, eventType)
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		err := dispatcher.Dispatch(cancelledCtx, tenantID, eventType, map[string]any{
+			"invoice_id": "inv_metric_test",
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dispatch with cancelled context: got %v, want context.Canceled", err)
+		}
+		if after := enqueueFailureCount(t, eventType); after != before+1 {
+			t.Errorf("counter after transaction start failure: got %v, want %v", after, before+1)
+		}
+	})
+
 	t.Run("failed enqueue increments only its event type", func(t *testing.T) {
 		before := enqueueFailureCount(t, eventType)
 		otherBefore := enqueueFailureCount(t, otherEventType)
